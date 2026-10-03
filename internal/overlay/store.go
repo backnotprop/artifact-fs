@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
@@ -43,7 +44,15 @@ type Store struct {
 	repo     model.RepoConfig
 	upperDir string
 	mu       sync.Mutex
+	changes  atomic.Uint64
 }
+
+// ChangeCount returns a counter that grows with every committed change to the
+// overlay. Front ends combine it with the snapshot generation to tell whether
+// a directory listing may have changed (the FSKit readdir verifier).
+func (s *Store) ChangeCount() uint64 { return s.changes.Load() }
+
+func (s *Store) bump() { s.changes.Add(1) }
 
 func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 	db, err := meta.OpenDB(cfg.OverlayDBPath)
@@ -227,6 +236,83 @@ func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, p
 func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.createFileLocked(ctx, path, mode)
+}
+
+// CreateFileExclusive creates an empty regular file like CreateFile, but fails
+// with fs.ErrExist when the merged view already has the name. baseExists
+// reports whether the base snapshot has the path. The check and the create run
+// under one lock, which front ends without a kernel-held directory lock
+// (FSKit) need for O_EXCL semantics.
+func (s *Store) CreateFileExclusive(ctx context.Context, path string, mode uint32, baseExists func(string) (bool, error)) (model.OverlayEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureNameFreeLocked(ctx, path, baseExists); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	return s.createFileLocked(ctx, path, mode)
+}
+
+// MkdirExclusive is Mkdir with the EEXIST check of CreateFileExclusive.
+func (s *Store) MkdirExclusive(ctx context.Context, path string, mode uint32, baseExists func(string) (bool, error)) (model.OverlayEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureNameFreeLocked(ctx, path, baseExists); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	return s.mkdirLocked(ctx, path, mode)
+}
+
+// CreateSymlinkExclusive is CreateSymlink with the EEXIST check of
+// CreateFileExclusive.
+func (s *Store) CreateSymlinkExclusive(ctx context.Context, path string, target string, baseExists func(string) (bool, error)) (model.OverlayEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureNameFreeLocked(ctx, path, baseExists); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	return s.createSymlinkLocked(ctx, path, target)
+}
+
+// ensureNameFreeLocked returns fs.ErrExist when path is visible in the merged
+// view: a live overlay entry, an overlay entry below it (an implicit
+// directory), or a base node not hidden by a delete entry.
+func (s *Store) ensureNameFreeLocked(ctx context.Context, path string, baseExists func(string) (bool, error)) error {
+	path = model.CleanPath(path)
+	if path == "." {
+		return iofs.ErrExist
+	}
+	if e, ok, err := s.Lookup(ctx, path); err != nil {
+		return err
+	} else if ok {
+		if e.IsDeleted() {
+			return nil
+		}
+		return iofs.ErrExist
+	}
+	prefix := path + "/"
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM overlay_entries WHERE substr(path, 1, length(?))=? AND kind<>? LIMIT 1`, prefix, prefix, model.OverlayKindDelete).Scan(&one)
+	if err == nil {
+		return iofs.ErrExist
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if baseExists == nil {
+		return nil
+	}
+	exists, err := baseExists(path)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return iofs.ErrExist
+	}
+	return nil
+}
+
+func (s *Store) createFileLocked(ctx context.Context, path string, mode uint32) (model.OverlayEntry, error) {
 	f, err := os.CreateTemp(s.upperDir, ".artifact-fs-entry-*")
 	if err != nil {
 		return model.OverlayEntry{}, err
@@ -253,6 +339,10 @@ func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model
 func (s *Store) CreateSymlink(ctx context.Context, path string, target string) (model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.createSymlinkLocked(ctx, path, target)
+}
+
+func (s *Store) createSymlinkLocked(ctx context.Context, path string, target string) (model.OverlayEntry, error) {
 	if len(target) > model.MaxSymlinkTargetBytes {
 		return model.OverlayEntry{}, fmt.Errorf("symlink target exceeds %d bytes", model.MaxSymlinkTargetBytes)
 	}
@@ -453,6 +543,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.bump()
 	if replaced.BackingPath != "" && replaced.BackingPath != newBacking {
 		_ = os.RemoveAll(replaced.BackingPath)
 	}
@@ -613,6 +704,7 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, s
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.bump()
 
 	for _, e := range destinationEntries {
 		if e.BackingPath != "" && !movedBackings[e.BackingPath] {
@@ -649,6 +741,9 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 			targetPath = e.TargetPath
 		}
 		_, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, source_mode=?, target_path=? WHERE path=?`, newKind, sourceOID, sourceMode, targetPath, oldPath)
+		if err == nil {
+			s.bump()
+		}
 		return err
 	}
 	newBacking := e.BackingPath
@@ -681,6 +776,7 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.bump()
 	if replaced.BackingPath != "" && replaced.BackingPath != newBacking {
 		_ = os.RemoveAll(replaced.BackingPath)
 	}
@@ -690,23 +786,28 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 func (s *Store) Mkdir(ctx context.Context, path string, mode uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_, err := s.mkdirLocked(ctx, path, mode)
+	return err
+}
+
+func (s *Store) mkdirLocked(ctx context.Context, path string, mode uint32) (model.OverlayEntry, error) {
 	path = model.CleanPath(path)
 	mode, _ = normalizeGitDirMode(mode)
 	backing, err := os.MkdirTemp(s.upperDir, ".artifact-fs-dir-*")
 	if err != nil {
-		return err
+		return model.OverlayEntry{}, err
 	}
 	if err := os.Chmod(backing, os.FileMode(mode)); err != nil {
 		os.Remove(backing)
-		return err
+		return model.OverlayEntry{}, err
 	}
 	now := time.Now().UnixNano()
 	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindMkdir, BackingPath: backing, Mode: mode, MtimeUnixNs: now, CtimeUnixNs: now}
 	if err := s.upsertEntry(ctx, e); err != nil {
 		os.Remove(backing)
-		return err
+		return model.OverlayEntry{}, err
 	}
-	return nil
+	return e, nil
 }
 
 func normalizeGitDirMode(mode uint32) (uint32, bool) {
@@ -730,12 +831,18 @@ func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 			_, err := s.db.ExecContext(ctx,
 				`UPDATE overlay_entries SET mode=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=?`,
 				mode, t.UnixNano(), time.Now().UnixNano(), path)
+			if err == nil {
+				s.bump()
+			}
 			return err
 		}
 	}
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE overlay_entries SET mtime_unix_ns=?, ctime_unix_ns=? WHERE path=?`,
 		t.UnixNano(), time.Now().UnixNano(), path)
+	if err == nil {
+		s.bump()
+	}
 	return err
 }
 
@@ -957,6 +1064,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.bump()
 	// Delete backing files only after the transaction commits. If we deleted
 	// before commit and the transaction rolled back, DB rows would reference
 	// non-existent files. Reverse order so children are removed before parents
@@ -1071,6 +1179,9 @@ func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
 	source_oid=excluded.source_oid,
 	source_mode=excluded.source_mode,
 	target_path=excluded.target_path`, e.Path, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.SourceMode, e.TargetPath)
+	if err == nil {
+		s.bump()
+	}
 	return err
 }
 
