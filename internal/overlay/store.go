@@ -200,12 +200,12 @@ func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, p
 		return model.OverlayEntry{}, err
 	}
 	if src != nil {
-		if err := copyFileFrom(src, backing, os.FileMode(base.Mode)); err != nil {
+		if err := copyFileFrom(src, backing, backingPerm(base.Mode)); err != nil {
 			os.Remove(backing)
 			return model.OverlayEntry{}, fmt.Errorf("copy-on-write %s: %w", path, err)
 		}
 	}
-	if err := os.Chmod(backing, os.FileMode(base.Mode)); err != nil {
+	if err := os.Chmod(backing, backingPerm(base.Mode)); err != nil {
 		os.Remove(backing)
 		return model.OverlayEntry{}, err
 	}
@@ -318,7 +318,7 @@ func (s *Store) createFileLocked(ctx context.Context, path string, mode uint32) 
 		return model.OverlayEntry{}, err
 	}
 	backing := f.Name()
-	if err := f.Chmod(os.FileMode(mode)); err != nil {
+	if err := f.Chmod(backingPerm(mode)); err != nil {
 		f.Close()
 		os.Remove(backing)
 		return model.OverlayEntry{}, err
@@ -373,7 +373,7 @@ func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []by
 	if !ok || e.IsDeleted() {
 		return 0, os.ErrNotExist
 	}
-	f, err := os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, os.FileMode(e.Mode))
+	f, err := os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, backingPerm(e.Mode))
 	if err != nil {
 		return 0, err
 	}
@@ -649,7 +649,7 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, s
 			if mode, normalized := normalizeGitDirMode(e.Mode); normalized {
 				e.Mode = mode
 				if e.BackingPath != "" {
-					if err := os.Chmod(e.BackingPath, os.FileMode(mode)); err != nil {
+					if err := os.Chmod(e.BackingPath, backingDirPerm(mode)); err != nil {
 						return err
 					}
 				}
@@ -797,7 +797,7 @@ func (s *Store) mkdirLocked(ctx context.Context, path string, mode uint32) (mode
 	if err != nil {
 		return model.OverlayEntry{}, err
 	}
-	if err := os.Chmod(backing, os.FileMode(mode)); err != nil {
+	if err := os.Chmod(backing, backingDirPerm(mode)); err != nil {
 		os.Remove(backing)
 		return model.OverlayEntry{}, err
 	}
@@ -809,6 +809,19 @@ func (s *Store) mkdirLocked(ctx context.Context, path string, mode uint32) (mode
 	}
 	return e, nil
 }
+
+// backingPerm is the permission a backing file gets: the entry's mode, plus
+// read and write for the owner. The mode a person sets is the entry's Mode,
+// which is what the mount shows; the backing file only has to stay usable by
+// the daemon. A daemon that is not root (always on a Mac) could otherwise
+// not write to a file created 0444, as git creates its packs, nor pin it
+// open for writing once it is removed, and the kernel's delayed writes to
+// it would be lost.
+func backingPerm(mode uint32) os.FileMode { return os.FileMode(mode&0o777) | 0o600 }
+
+// backingDirPerm is backingPerm for a folder: the owner can always list,
+// enter and create in it.
+func backingDirPerm(mode uint32) os.FileMode { return os.FileMode(mode&0o777) | 0o700 }
 
 func normalizeGitDirMode(mode uint32) (uint32, bool) {
 	if mode&0o170000 == 0o40000 && mode&0o777 == 0 {
@@ -825,7 +838,7 @@ func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 		return err
 	} else if ok && e.Kind == model.OverlayKindMkdir {
 		if mode, normalized := normalizeGitDirMode(e.Mode); normalized {
-			if err := os.Chmod(e.BackingPath, os.FileMode(mode)); err != nil {
+			if err := os.Chmod(e.BackingPath, backingDirPerm(mode)); err != nil {
 				return err
 			}
 			_, err := s.db.ExecContext(ctx,
@@ -859,7 +872,11 @@ func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
 	}
 	e.Mode = e.Mode&^0o777 | mode&0o777
 	if e.BackingPath != "" {
-		if err := os.Chmod(e.BackingPath, os.FileMode(e.Mode)); err != nil {
+		perm := backingPerm(e.Mode)
+		if e.Kind == model.OverlayKindMkdir {
+			perm = backingDirPerm(e.Mode)
+		}
+		if err := os.Chmod(e.BackingPath, perm); err != nil {
 			return err
 		}
 	}

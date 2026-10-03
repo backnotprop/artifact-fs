@@ -1489,3 +1489,47 @@ func TestSetMtime(t *testing.T) {
 		t.Fatal("ctime should be non-zero")
 	}
 }
+
+// A daemon that is not root (always on a Mac) must keep writing to a file
+// whose mode has no write bit: git creates its packs 0444 and writes them
+// through the open descriptor, and the kernel flushes cached writes later.
+// The mode shown stays the one set; the backing file stays writable.
+func TestReadOnlyModeKeepsBackingWritable(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, "pack.tmp", 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "pack.tmp", 0, []byte("abc")); err != nil {
+		t.Fatalf("write to a 0444 file: %v", err)
+	}
+	if err := s.SetMode(ctx, "pack.tmp", 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "pack.tmp", 3, []byte("def")); err != nil {
+		t.Fatalf("write after chmod 0400: %v", err)
+	}
+	e, ok, err := s.Lookup(ctx, "pack.tmp")
+	if err != nil || !ok {
+		t.Fatalf("lookup: %v %v", ok, err)
+	}
+	if e.Mode&0o777 != 0o400 {
+		t.Fatalf("mode shown = %o, want 400", e.Mode&0o777)
+	}
+	// The removed-item pin opens the backing file read-write.
+	f, err := os.OpenFile(e.BackingPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("backing file not writable by its owner: %v", err)
+	}
+	f.Close()
+	if b, _ := os.ReadFile(e.BackingPath); string(b) != "abcdef" {
+		t.Fatalf("content = %q", b)
+	}
+	if err := s.Mkdir(ctx, "ro", 0o555); err != nil {
+		t.Fatal(err)
+	}
+	d, _, _ := s.Lookup(ctx, "ro")
+	if st, err := os.Stat(d.BackingPath); err != nil || st.Mode().Perm()&0o700 != 0o700 {
+		t.Fatalf("backing folder perm %v %v", st.Mode().Perm(), err)
+	}
+}
