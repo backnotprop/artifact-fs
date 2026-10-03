@@ -38,6 +38,7 @@ var migrations = []string{
 	  required_commit TEXT NOT NULL DEFAULT '',
 	  history_depth INTEGER NOT NULL DEFAULT 0,
 	  refresh_disabled INTEGER NOT NULL DEFAULT 0,
+	  read_only INTEGER NOT NULL DEFAULT 0,
 	  acquired_ref TEXT NOT NULL DEFAULT '',
 	  acquired_commit TEXT NOT NULL DEFAULT '',
 	  acquired_at_ns INTEGER NOT NULL DEFAULT 0,
@@ -79,8 +80,8 @@ func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 		cfg.ConfigVersion = fmt.Sprintf("%d", now)
 	}
 	_, err := s.db.ExecContext(ctx, `
-	INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version, created_at_ns, updated_at_ns)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, read_only, acquired_ref, acquired_commit, acquired_at_ns, config_version, created_at_ns, updated_at_ns)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(repo_id) DO UPDATE SET
 	name=excluded.name,
 	mount_root=excluded.mount_root,
@@ -103,12 +104,13 @@ func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 	required_commit=excluded.required_commit,
 	history_depth=excluded.history_depth,
 	refresh_disabled=excluded.refresh_disabled,
+	read_only=excluded.read_only,
 	acquired_ref=excluded.acquired_ref,
 	acquired_commit=excluded.acquired_commit,
 	acquired_at_ns=excluded.acquired_at_ns,
 	config_version=excluded.config_version,
 	updated_at_ns=excluded.updated_at_ns
-	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), cfg.FetchRef, cfg.PrepareState, cfg.PrepareError, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), cfg.AcquiredRef, cfg.AcquiredCommit, acquiredAtNS, cfg.ConfigVersion, now, now)
+	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), cfg.FetchRef, cfg.PrepareState, cfg.PrepareError, cfg.RequiredCommit, cfg.HistoryDepth, boolToInt(cfg.RemoteRefreshDisabled), boolToInt(cfg.ReadOnly), cfg.AcquiredRef, cfg.AcquiredCommit, acquiredAtNS, cfg.ConfigVersion, now, now)
 	return err
 }
 
@@ -228,12 +230,12 @@ func (s *Store) RemoveRepo(ctx context.Context, name string) error {
 }
 
 func (s *Store) GetRepo(ctx context.Context, name string) (model.RepoConfig, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version FROM repos WHERE name=?`, name)
+	row := s.db.QueryRowContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, read_only, acquired_ref, acquired_commit, acquired_at_ns, config_version FROM repos WHERE name=?`, name)
 	return scanRepo(row)
 }
 
 func (s *Store) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, acquired_ref, acquired_commit, acquired_at_ns, config_version FROM repos ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, required_commit, history_depth, refresh_disabled, read_only, acquired_ref, acquired_commit, acquired_at_ns, config_version FROM repos ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -260,8 +262,9 @@ func scanRepo(s scanner) (model.RepoConfig, error) {
 	var enabled int
 	var preparedGitDir int
 	var refreshDisabled int
+	var readOnly int
 	var acquiredAtNS int64
-	if err := s.Scan(&cfg.ID, &cfg.Name, &cfg.MountRoot, &cfg.MountPath, &cfg.RemoteURL, &cfg.RemoteURLRedacted, &cfg.Branch, &refresh, &refreshNS, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath, &enabled, &preparedGitDir, &cfg.FetchRef, &cfg.PrepareState, &cfg.PrepareError, &cfg.RequiredCommit, &cfg.HistoryDepth, &refreshDisabled, &cfg.AcquiredRef, &cfg.AcquiredCommit, &acquiredAtNS, &cfg.ConfigVersion); err != nil {
+	if err := s.Scan(&cfg.ID, &cfg.Name, &cfg.MountRoot, &cfg.MountPath, &cfg.RemoteURL, &cfg.RemoteURLRedacted, &cfg.Branch, &refresh, &refreshNS, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath, &enabled, &preparedGitDir, &cfg.FetchRef, &cfg.PrepareState, &cfg.PrepareError, &cfg.RequiredCommit, &cfg.HistoryDepth, &refreshDisabled, &readOnly, &cfg.AcquiredRef, &cfg.AcquiredCommit, &acquiredAtNS, &cfg.ConfigVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return cfg, fmt.Errorf("repo not found")
 		}
@@ -277,6 +280,7 @@ func scanRepo(s scanner) (model.RepoConfig, error) {
 	cfg.Enabled = enabled == 1
 	cfg.PreparedGitDir = preparedGitDir == 1
 	cfg.RemoteRefreshDisabled = refreshDisabled == 1
+	cfg.ReadOnly = readOnly == 1
 	if acquiredAtNS > 0 {
 		cfg.AcquiredAt = time.Unix(0, acquiredAtNS)
 	}
@@ -323,6 +327,7 @@ func ensureRepoColumns(ctx context.Context, db *sql.DB) error {
 		"required_commit":     `TEXT NOT NULL DEFAULT ''`,
 		"history_depth":       `INTEGER NOT NULL DEFAULT 0`,
 		"refresh_disabled":    `INTEGER NOT NULL DEFAULT 0`,
+		"read_only":           `INTEGER NOT NULL DEFAULT 0`,
 		"acquired_ref":        `TEXT NOT NULL DEFAULT ''`,
 		"acquired_commit":     `TEXT NOT NULL DEFAULT ''`,
 		"acquired_at_ns":      `INTEGER NOT NULL DEFAULT 0`,

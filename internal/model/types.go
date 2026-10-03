@@ -51,10 +51,12 @@ type RepoConfig struct {
 	RequiredCommit        string
 	HistoryDepth          int
 	RemoteRefreshDisabled bool
-	AcquiredRef           string
-	AcquiredCommit        string
-	AcquiredAt            time.Time
-	ConfigVersion         string
+	// ReadOnly mounts the repo read-only: writes fail with EROFS.
+	ReadOnly       bool
+	AcquiredRef    string
+	AcquiredCommit string
+	AcquiredAt     time.Time
+	ConfigVersion  string
 }
 
 type RepoRuntimeState struct {

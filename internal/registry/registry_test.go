@@ -38,6 +38,7 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 		RequiredCommit:        "0123456789012345678901234567890123456789",
 		HistoryDepth:          1,
 		RemoteRefreshDisabled: true,
+		ReadOnly:              true,
 		ConfigVersion:         "version-1",
 	}
 	if err := store.AddRepo(ctx, cfg); err != nil {
@@ -65,6 +66,9 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	}
 	if got.RequiredCommit != cfg.RequiredCommit || got.HistoryDepth != 1 || !got.RemoteRefreshDisabled {
 		t.Fatalf("source policy = %+v", got)
+	}
+	if !got.ReadOnly {
+		t.Fatal("ReadOnly = false, want true")
 	}
 	if err := store.RecordAcquisition(ctx, cfg, model.PreparedSource{Ref: cfg.Branch, Commit: cfg.RequiredCommit, Verified: true}); err != nil {
 		t.Fatal(err)
