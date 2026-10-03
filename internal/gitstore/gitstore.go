@@ -1131,6 +1131,11 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// A blobless clone lacks most blob sizes; ask the remote for them so the
+	// mount can stat and list files without downloading them.
+	if err := s.resolveRemoteSizes(ctx, repo, nodes, blobOIDs, blobIndex); err != nil {
+		return nil, err
+	}
 	return addImplicitDirs(repo.ID, nodes), nil
 }
 
