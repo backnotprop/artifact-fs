@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
+	"github.com/cloudflare/artifact-fs/internal/fskit"
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
@@ -1032,9 +1033,9 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		Hydrator: h,
 	}
 
-	mfs, err := fusefs.MountRepo(cfg, resolver, engine)
+	mfs, err := s.mountFrontEnd(cfg, resolver, engine, nil)
 	if err != nil {
-		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
+		s.logger.Error("mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
 	} else {
 		s.configureStatusOptimization(ctx, cfg)
@@ -1102,9 +1103,9 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, err := s.mountFrontEnd(cfg, resolver, engine, gate)
 	if err != nil {
-		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
+		s.logger.Error("mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
 	}
 	state := cfg.PrepareState
@@ -1637,6 +1638,9 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 			return
 		}
 	}
+	if prevGen > 0 && prevGen != gen {
+		s.writeServerChanges(ctx, rt, prevGen, gen)
+	}
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return rt.snapshot.LookupNode(ctx, gen, path)
 	}
@@ -1671,6 +1675,46 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	if err := rt.snapshot.PruneGenerations(ctx, min(prevGen, gen-1)); err != nil {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
+}
+
+// serverChangeWriter is a mount that must be told about changes made
+// underneath it (the FSKit front end: macOS 26 has no way to invalidate the
+// kernel's caches for a file system extension).
+type serverChangeWriter interface {
+	WriteThrough(ctx context.Context, changes []fskit.Change) error
+}
+
+// writeServerChanges replays what changed between two generations through
+// the mount before the generation switch, so Finder, editors and the kernel
+// see a server-side change (a merge into worktrees/main) as it lands. Paths
+// with local edits are left to the overlay reconcile. The overlay entries the
+// writes create match the new base and are reconciled away by the switch.
+func (s *Service) writeServerChanges(ctx context.Context, rt *repoRuntime, oldGen, newGen int64) {
+	s.mu.Lock()
+	w, ok := rt.mfs.(serverChangeWriter)
+	cfg := rt.cfg
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	diff, err := rt.snapshot.DiffGenerations(ctx, oldGen, newGen)
+	if err != nil {
+		s.logger.Warn("server change diff failed", "repo", cfg.Name, "error", err)
+		return
+	}
+	changes, err := fskit.ServerChanges(ctx, diff, rt.overlay, rt.hydrator, cfg)
+	if err != nil {
+		s.logger.Warn("server change read failed", "repo", cfg.Name, "error", err)
+		return
+	}
+	if len(changes) == 0 {
+		return
+	}
+	if err := w.WriteThrough(ctx, changes); err != nil {
+		s.logger.Warn("server change write-through failed", "repo", cfg.Name, "changes", len(changes), "error", err)
+		return
+	}
+	s.logger.Info("server changes written through the mount", "repo", cfg.Name, "changes", len(changes))
 }
 
 func (s *Service) scheduleHEADRetry(rt *repoRuntime) {
@@ -2047,7 +2091,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, err := s.mountFrontEnd(cfg, resolver, engine, gate)
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]
