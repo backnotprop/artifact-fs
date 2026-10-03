@@ -41,11 +41,18 @@ FSKit extension  --XPC-->  broker  --unix socket-->  daemon
 
 - The extension receives the state dir as its `FSPathURLResource` (a
   security-scoped URL). The mount id is the state dir's last path component.
+- The daemon uses the repo's id as the mount id when it fits the pattern,
+  and otherwise `m-` followed by 16 hex digits of the id's SHA-256.
 - The broker builds the socket path itself from `$HOME` and the mount id. It
   rejects a mount id that breaks the pattern above, and it never accepts a
   path from the extension.
-- `$HOME/.pando/fskit/` keeps the socket path under the 104-byte limit for
-  unix socket paths on macOS.
+- Unix socket paths are limited to 104 bytes on macOS, and a long user name
+  with a long mount id goes over. The socket file always lives at
+  `<state dir>/fskit.sock`. When that path is too long, the daemon binds it
+  through a short symlink to the state dir (`/tmp/pfs*/d`, removed after
+  binding), and the broker connects relative to the state dir.
+- `PANDO_FSKIT_DIR` replaces `$HOME/.pando/fskit` in tests only. The broker
+  and the daemon both honour it; a shipped setup never sets it.
 
 ## 2. Framing
 
@@ -308,9 +315,20 @@ change counter.
   directory, then a rename over the target; a delete is an unlink. The
   extension needs no special handling: these arrive as ordinary `create`,
   `write`, `setattr` and `rename` requests.
-- **Read-only mounts.** A mount can be read-only (`worktrees/main`). Then
-  every change gets EROFS (30), except the daemon's own write-through
-  changes above.
+- **When the daemon writes through.** When the repo's HEAD moves (for
+  example an `update-ref` in its git dir after a fetch), the daemon lists
+  what changed between the old and new snapshot, skips every path with a
+  local edit, writes the rest through the mount, and then switches to the
+  new snapshot. The overlay entries the writes made match the new snapshot,
+  so the switch removes them and the worktree stays clean. Files over
+  64 MiB are skipped; the kernel picks them up on the next open.
+- **Read-only mounts.** `artifact-fs add-repo --read-only` mounts a repo
+  read-only (`worktrees/main`, references). Every change then gets EROFS
+  (30), except the daemon's own write-through changes above. For that
+  reason the Mac volume is not mounted with `-o rdonly`: the daemon refuses
+  changes itself. On Linux the FUSE mount is read-only in the kernel, which
+  needs no write-through because FUSE attribute caches expire in about a
+  second.
 
 ## 6. Errors
 
@@ -345,7 +363,9 @@ From the diligence report, section 6.7. None of this changes the wire.
   `xpc_connection_send_message_with_reply` on a concurrent queue, return,
   and call FSKit's reply handler from the XPC reply block.
 - Cap requests in flight (64) and give each a deadline (120 s for `read`,
-  30 s otherwise); a timeout replies EIO.
+  `write` and `setattr` with a size, 30 s otherwise); a timeout replies EIO.
+- The broker may add a `message` field to an error reply it makes itself
+  (for example when the daemon is not running); the extension logs it.
 - Report the root as `.rootDirectory`; set
   `supportsPersistentObjectIDs = false`; implement `maximumFileSize`.
 - Fill attributes as in section 4.1; set `consumedAttributes` from the

@@ -1,0 +1,33 @@
+ArtifactFS
+Copyright Cloudflare, Inc.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This fork (https://github.com/backnotprop/artifact-fs) adds a macOS front
+end for the Pando FSKit extension: the package internal/fskit and the wire
+contract docs/pando-fskit-wire-v3.md.
+
+Parts of internal/fskit are translated to Go from Oak's FSKit backend
+(https://oak.space/oak/oak, mirror https://github.com/oakdotspace/oak),
+Copyright Oakspace Inc. and the Oak contributors, licensed under the Apache
+License, Version 2.0 (the same text as LICENSE). Source:
+cli/src/commands/mount/fskit/ (protocol.rs, ipc.rs, server.rs, mod.rs) at
+commit 8d35309d4187dfceefe03a74cf4612c179ab524e (2026-09-27). Oak's licence
+covers its code; Oak's name and logo are not used.
+
+What was translated, and how it changed (Apache 2.0, section 4(b)):
+
+- protocol.rs and ipc.rs: the length-prefixed request and reply framing
+  became wire version 3 (a u32 frame length, a u32 header length, a JSON
+  header with request ids, raw payload bytes), with 15 operations:
+  setattr replaces truncate; symlink and forget are new; readdir is paged.
+  The accept loop blocks instead of polling, and each connection carries
+  many requests at once.
+- server.rs: per-operation dispatch, rewritten over ArtifactFS's Resolver
+  and Engine, with an inode table (root 2, others from 3, stable per path),
+  removed items kept until forget, EEXIST for create, mkdir and symlink,
+  directory verifiers, and a per-operation errno mapping.
+- mod.rs: the macOS mount driver (internal/fskit/mount_darwin.go): running
+  /sbin/mount -F for the FSKit volume, refusing to run as root, checking
+  the extension with pluginkit, and turning mount failures (an extension
+  that is off or missing, a privacy-protected folder) into plain
+  instructions.

@@ -38,7 +38,7 @@ type harness struct {
 	snap  *snapshot.Store
 	res   *fusefs.Resolver
 	gen   int64
-	work  string // the remote's working copy
+	work  string            // the remote's working copy
 	files map[string]string // base files and their content
 }
 
