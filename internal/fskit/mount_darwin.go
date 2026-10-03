@@ -235,11 +235,11 @@ func explainMountError(mountPoint, output string, err error, state extensionStat
 }
 
 func errExtensionMissing(detail string) error {
-	return errors.New(strings.TrimSpace(fmt.Sprintf("the Pando file system extension is not installed. Open Pando.app once so macOS registers it, then turn on Pando in %s. To check: pluginkit -m -i %s %s", settingsPath, ExtensionBundleID, detail)))
+	return errors.New(strings.TrimSpace(fmt.Sprintf("macOS does not list the Pando file system extension. Open Pando.app once so macOS registers it (after replacing the app: pluginkit -a /Applications/Pando.app/Contents/Extensions/PandoExtension.appex), then turn on Pando in %s. To check: pluginkit -m -i %s %s", settingsPath, ExtensionBundleID, detail)))
 }
 
 func errExtensionDisabled(detail string) error {
-	return errors.New(strings.TrimSpace(fmt.Sprintf("the Pando file system extension is turned off. Turn on Pando in %s, then try again %s", settingsPath, detail)))
+	return errors.New(strings.TrimSpace(fmt.Sprintf("the Pando file system extension is turned off. Turn on Pando in %s (show the list By Category and click the info button; replacing Pando.app turns it off again), then try again %s", settingsPath, detail)))
 }
 
 // protectedFolder names the privacy-protected folder that holds path, if any.
