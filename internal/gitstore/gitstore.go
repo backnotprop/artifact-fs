@@ -353,6 +353,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	if _, err := runGit(ctx, targetGitDir, "read-tree", "HEAD"); err != nil {
 		return err
 	}
+	s.markFreshIndex(ctx, targetGitDir, cfg.Name)
 	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
 		return err
 	}
@@ -460,6 +461,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		return model.PreparedSource{}, err
 	}
 	defer os.RemoveAll(candidateGitDir)
+	s.markFreshIndex(ctx, candidateGitDir, cfg.Name)
 	if err := installGitDir(candidateGitDir, cfg.GitDir); err != nil {
 		return model.PreparedSource{}, err
 	}
@@ -1127,6 +1129,11 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 		s.logger.Warn("batch size resolution failed, some file sizes will resolve on demand", "repo", repo.Name, "error", err)
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// A blobless clone lacks most blob sizes; ask the remote for them so the
+	// mount can stat and list files without downloading them.
+	if err := s.resolveRemoteSizes(ctx, repo, nodes, blobOIDs, blobIndex); err != nil {
 		return nil, err
 	}
 	return addImplicitDirs(repo.ID, nodes), nil
@@ -1804,8 +1811,11 @@ func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid 
 // ReadTreeHEAD initializes the index during controlled clone or preparation.
 // Do not call it from delayed HEAD watchers: it can discard newer staged work.
 func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
-	_, err := runGit(ctx, repo.GitDir, "read-tree", "HEAD")
-	return err
+	if _, err := runGit(ctx, repo.GitDir, "read-tree", "HEAD"); err != nil {
+		return err
+	}
+	s.markFreshIndex(ctx, repo.GitDir, repo.Name)
+	return nil
 }
 
 // EnsureIndexInitialized creates a missing index without replacing staged work.

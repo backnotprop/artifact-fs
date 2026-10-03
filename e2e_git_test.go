@@ -34,12 +34,21 @@ type mountedE2ERepo struct {
 
 func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 	t.Helper()
+	return newMountedE2ERepoFrom(t, "")
+}
+
+// newMountedE2ERepoFrom mounts remoteURL, or the default test remote when it
+// is empty.
+func newMountedE2ERepoFrom(t *testing.T, remoteURL string) *mountedE2ERepo {
+	t.Helper()
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
 		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
 	}
 	skipIfNoFUSE(t)
 
-	remoteURL := os.Getenv("AFS_E2E_REPO")
+	if remoteURL == "" {
+		remoteURL = os.Getenv("AFS_E2E_REPO")
+	}
 	if remoteURL == "" {
 		remoteURL = createLocalTestRepo(t)
 	}
