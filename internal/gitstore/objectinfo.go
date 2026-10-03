@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -36,6 +37,10 @@ var errObjectInfoUnsupported = errors.New("remote does not offer object-info")
 // objectInfoBatch caps the object IDs in one request (about 460 KiB), under
 // git's default http.postBuffer so each request is one plain POST.
 const objectInfoBatch = 10000
+
+// remoteSizeTimeout bounds the whole size lookup so a slow remote delays a
+// snapshot by at most this long; sizes then resolve on demand.
+const remoteSizeTimeout = 2 * time.Minute
 
 const (
 	pktFlush       = "0000"
@@ -366,7 +371,9 @@ func (s *Store) resolveRemoteSizes(ctx context.Context, repo model.RepoConfig, n
 	if len(missing) == 0 {
 		return nil
 	}
-	sizes, err := s.remoteBlobSizes(ctx, repo, missing)
+	lookupCtx, cancel := context.WithTimeout(ctx, remoteSizeTimeout)
+	defer cancel()
+	sizes, err := s.remoteBlobSizes(lookupCtx, repo, missing)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
