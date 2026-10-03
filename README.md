@@ -26,9 +26,9 @@ ArtifactFS is the optional FUSE driver -- it lets you mount an Artifact (or any 
 
 ## Build and Install
 
-Requires Go 1.26+ and a FUSE implementation:
+Requires Go 1.26+ and a file system front end:
 
-- **macOS** -- [macFUSE](https://osxfuse.github.io/)
+- **macOS** -- the Pando FSKit extension (Pando.app, macOS 26 or later). This fork serves it from `internal/fskit` over the wire described in [docs/pando-fskit-wire-v3.md](docs/pando-fskit-wire-v3.md); the macOS build has no macFUSE code.
 - **Linux** -- `fuse3` (`apt install fuse3` on Debian/Ubuntu, `dnf install fuse3` on Fedora)
 
 Install the CLI from the module:
@@ -338,7 +338,7 @@ Unit tests:
 go test ./...
 ```
 
-End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default.
+End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They run on Linux only, require `fuse3`, and are off by default. The FSKit front end is covered by `go test ./internal/fskit`, which needs no mount.
 
 By default, e2e tests create a local bare repo -- no network required. Set `AFS_E2E_REPO` to test against a real remote.
 

@@ -71,6 +71,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
+				ucli.BoolFlag{Name: "read-only", Usage: "mount read-only; writes fail with EROFS"},
 			},
 			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
 				name := strings.TrimSpace(c.String("name"))
@@ -119,6 +120,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					GitDir:                c.String("git-dir"),
 					PreparedGitDir:        preparedGitDir,
 					FetchRef:              c.String("fetch-ref"),
+					ReadOnly:              c.Bool("read-only"),
 					Enabled:               true,
 				}
 				if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: async}); err != nil {

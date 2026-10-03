@@ -82,6 +82,16 @@ func (f *fakeOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.Repo
 func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.OverlayEntry, error) {
 	return model.OverlayEntry{}, nil
 }
+func (f *fakeOverlay) CreateFileExclusive(ctx context.Context, path string, mode uint32, _ func(string) (bool, error)) (model.OverlayEntry, error) {
+	return f.CreateFile(ctx, path, mode)
+}
+func (f *fakeOverlay) MkdirExclusive(ctx context.Context, path string, mode uint32, _ func(string) (bool, error)) (model.OverlayEntry, error) {
+	return model.OverlayEntry{}, f.Mkdir(ctx, path, mode)
+}
+func (f *fakeOverlay) CreateSymlinkExclusive(ctx context.Context, path string, target string, _ func(string) (bool, error)) (model.OverlayEntry, error) {
+	return f.CreateSymlink(ctx, path, target)
+}
+func (f *fakeOverlay) ChangeCount() uint64 { return 0 }
 func (f *fakeOverlay) CreateSymlink(_ context.Context, path string, target string) (model.OverlayEntry, error) {
 	if f.entries == nil {
 		f.entries = map[string]model.OverlayEntry{}

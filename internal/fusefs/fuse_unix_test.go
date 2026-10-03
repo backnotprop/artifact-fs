@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build linux
 
 package fusefs
 
@@ -721,3 +721,138 @@ func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ m
 }
 
 func (f *fakeLookupHydrator) QueueDepth(model.RepoID) int { return 0 }
+
+func TestFileHandleCachesHydratedBaseFile(t *testing.T) {
+	tmp := t.TempDir()
+	cachePath := filepath.Join(tmp, "blob")
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &fakeBatchHydrator{path: cachePath}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	engine := &Engine{
+		Repo:     model.RepoConfig{ID: "repo"},
+		Resolver: newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob"}}}, overlay),
+		Overlay:  overlay,
+		Hydrator: h,
+	}
+	fh := &FileHandle{path: "file.txt"}
+	defer fh.closeCachedFile()
+
+	first, err := fh.read(context.Background(), engine, 0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := fh.read(context.Background(), engine, 4, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != "cont" || string(second) != "ent" {
+		t.Fatalf("reads = %q/%q", first, second)
+	}
+	if h.calls != 1 {
+		t.Fatalf("EnsureHydrated calls = %d, want 1", h.calls)
+	}
+}
+
+func TestFileHandleRehydratesAfterGenerationChange(t *testing.T) {
+	tmp := t.TempDir()
+	firstCache := filepath.Join(tmp, "first")
+	secondCache := filepath.Join(tmp, "second")
+	if err := os.WriteFile(firstCache, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondCache, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &fakeBatchHydrator{pathsByOID: map[string]string{"first": firstCache, "second": secondCache}}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := &Resolver{
+		Snapshot: &generationSnapshot{nodes: map[int64]map[string]model.BaseNode{
+			1: {"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "first"}},
+			2: {"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "second"}},
+		}},
+		Overlay: overlay,
+	}
+	resolver.SetGeneration(1)
+	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
+	fh := &FileHandle{path: "file.txt"}
+	defer fh.closeCachedFile()
+
+	first, err := fh.read(context.Background(), engine, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.SetGeneration(2)
+	second, err := fh.read(context.Background(), engine, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != "old" || string(second) != "new" {
+		t.Fatalf("reads = %q/%q", first, second)
+	}
+	if h.calls != 2 {
+		t.Fatalf("EnsureHydrated calls = %d, want 2", h.calls)
+	}
+}
+
+func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
+	tmp := t.TempDir()
+	baseCache := filepath.Join(tmp, "base")
+	overlayBacking := filepath.Join(tmp, "overlay")
+	if err := os.WriteFile(baseCache, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &fakeBatchHydrator{path: baseCache}
+	overlay := &blockingCopyOverlay{
+		fakeOverlay:  &fakeOverlay{entries: map[string]model.OverlayEntry{}},
+		beforeCopy:   make(chan struct{}),
+		continueCopy: make(chan struct{}),
+		backingPath:  overlayBacking,
+	}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": {Path: "file.txt", Type: "file", ObjectOID: "blob", Mode: 0o644}}}, overlay.fakeOverlay)
+	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
+	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, resolver, engine)
+	fh := &FileHandle{path: "file.txt"}
+	fs.fileHandles[1] = fh
+	defer fh.closeCachedFile()
+
+	first, err := fh.read(context.Background(), engine, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != "old" {
+		t.Fatalf("first read = %q", first)
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		fs.closeCachedFilesForPath("file.txt")
+		_, err := engine.Write(context.Background(), "file.txt", 0, []byte("new"))
+		if err == nil {
+			fs.closeCachedFilesForPath("file.txt")
+		}
+		writeDone <- err
+	}()
+
+	<-overlay.beforeCopy
+	overlapped, err := fh.read(context.Background(), engine, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(overlapped) != "old" {
+		t.Fatalf("overlapped read = %q", overlapped)
+	}
+	close(overlay.continueCopy)
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := fh.read(context.Background(), engine, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != "new" {
+		t.Fatalf("read after write = %q, want new", after)
+	}
+}

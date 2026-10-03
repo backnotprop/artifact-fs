@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build linux
 
 package fusefs
 
@@ -19,12 +19,6 @@ import (
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
 )
-
-// MountedFS matches tigrisfs's interface for mount lifecycle.
-type MountedFS interface {
-	Join(ctx context.Context) error
-	Unmount() error
-}
 
 // ArtifactFuse is the FUSE adapter following the tigrisfs GoofysFuse pattern:
 // embed NotImplementedFileSystem + core state, thin operation wrappers.
@@ -72,19 +66,6 @@ type FileHandle struct {
 	cacheGeneration int64
 	invalidateSeq   uint64
 	detached        bool
-}
-
-// ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
-type ReaddirEntry struct {
-	Name        string
-	Type        string // file, dir, symlink
-	Mode        uint32
-	ObjectOID   string
-	SizeState   string
-	SizeBytes   int64
-	FromOverlay bool
-	MtimeUnixNs int64
-	CtimeUnixNs int64
 }
 
 func (e ReaddirEntry) direntType() fuseutil.DirentType {
@@ -1148,6 +1129,7 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
 		UseVectoredRead:         true,
+		ReadOnly:                repo.ReadOnly,
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(mountCfg)

@@ -51,10 +51,12 @@ type RepoConfig struct {
 	RequiredCommit        string
 	HistoryDepth          int
 	RemoteRefreshDisabled bool
-	AcquiredRef           string
-	AcquiredCommit        string
-	AcquiredAt            time.Time
-	ConfigVersion         string
+	// ReadOnly mounts the repo read-only: writes fail with EROFS.
+	ReadOnly       bool
+	AcquiredRef    string
+	AcquiredCommit string
+	AcquiredAt     time.Time
+	ConfigVersion  string
 }
 
 type RepoRuntimeState struct {
@@ -218,6 +220,11 @@ type OverlayStore interface {
 	EnsureCopyOnWriteFrom(ctx context.Context, repo RepoConfig, path string, base BaseNode, src *os.File) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	CreateSymlink(ctx context.Context, path string, target string) (OverlayEntry, error)
+	// The Exclusive variants fail with fs.ErrExist when the merged view (the
+	// overlay plus a base snapshot that baseExists reports on) has the name.
+	CreateFileExclusive(ctx context.Context, path string, mode uint32, baseExists func(path string) (bool, error)) (OverlayEntry, error)
+	MkdirExclusive(ctx context.Context, path string, mode uint32, baseExists func(path string) (bool, error)) (OverlayEntry, error)
+	CreateSymlinkExclusive(ctx context.Context, path string, target string, baseExists func(path string) (bool, error)) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
 	SyncFile(ctx context.Context, path string) error
 	Truncate(ctx context.Context, path string, size int64) error
@@ -232,6 +239,8 @@ type OverlayStore interface {
 	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error)) error
 	DirtyCount(ctx context.Context) (int64, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
+	// ChangeCount grows with every committed overlay change.
+	ChangeCount() uint64
 }
 
 type Hydrator interface {

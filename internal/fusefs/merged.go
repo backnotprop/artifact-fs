@@ -124,6 +124,12 @@ func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType strin
 	return mode, n.Base.SizeBytes, n.Base.Type, mt, mt, nil
 }
 
+// Type returns the node's type: file, dir or symlink.
+func (n ResolvedNode) Type() string { return resolvedNodeType(n) }
+
+// NormalizeMode is normalizeMode for other front ends.
+func NormalizeMode(mode uint32, typ string) uint32 { return normalizeMode(mode, typ) }
+
 // normalizeMode ensures sane permission bits. Git tree entries have mode 040000
 // which has zero permission bits after masking; directories need at least 0o755.
 func normalizeMode(mode uint32, typ string) uint32 {
