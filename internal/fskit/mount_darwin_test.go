@@ -48,6 +48,8 @@ func TestExplainMountError(t *testing.T) {
 		{"/tmp/pando-x", "mount: Unable to invoke task", extensionUnknown, "Open Pando.app once"},
 		{"/tmp/pando-x", "mount: something else", extensionNotRegistered, "Open Pando.app once"},
 		{"/tmp/pando-x", "mount: something else", extensionEnabled, "mounting /tmp/pando-x failed"},
+		// macOS 26.3, after Pando.app was replaced while fskit_agent ran.
+		{"/tmp/pando-x", "mount: Probing resource: The operation couldn’t be completed. (com.apple.extensionKit.errorDomain error 2.)\nmount: Unable to invoke task", extensionEnabled, "killall -9 fskit_agent"},
 	}
 	for _, tc := range cases {
 		got := explainMountError(tc.mountPoint, tc.output, exit, tc.state).Error()

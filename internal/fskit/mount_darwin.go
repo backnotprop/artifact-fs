@@ -224,6 +224,10 @@ func explainMountError(mountPoint, output string, err error, state extensionStat
 		return fmt.Errorf("macOS refused to mount at %s (Operation not permitted). This is a privacy setting, not the extension. Mount somewhere under your home folder, or give your terminal Full Disk Access in System Settings > Privacy & Security > Full Disk Access and reopen it %s", mountPoint, detail)
 	case strings.Contains(output, "is disabled") || state == extensionDisabled:
 		return errExtensionDisabled(detail)
+	case state == extensionEnabled && strings.Contains(output, "extensionKit.errorDomain"):
+		// Seen on macOS 26.3 after Pando.app was installed or replaced:
+		// fskit_agent still holds the old copy and cannot start it.
+		return fmt.Errorf("macOS could not start the Pando extension, which happens when FSKit's agent still holds an older copy of Pando.app. Run killall -9 fskit_agent (it starts again by itself; no sudo), or log out and back in, then try again. Eject any other FSKit volume first, such as an exFAT or FAT drive %s", detail)
 	case state == extensionNotRegistered || strings.Contains(output, "Unable to invoke task") || strings.Contains(output, "unknown") || strings.Contains(output, "not supported"):
 		return errExtensionMissing(detail)
 	}
