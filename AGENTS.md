@@ -15,7 +15,8 @@ Repository-specific guidance for `artifact-fs`.
 - `cmd/artifact-fs` is the only binary entrypoint.
 - `internal/cli` wires commands onto `daemon.Service`.
 - `internal/daemon` owns repo lifecycle: registry sync, snapshot publish, overlay reconcile, FUSE mount, watcher, refresh loop.
-- `internal/fusefs` is the merged view and writable filesystem layer.
+- `internal/fusefs` is the merged view and writable filesystem layer. Its FUSE front end builds for Linux only.
+- `internal/fskit` is the macOS front end: a unix socket server for the Pando FSKit extension (`docs/pando-fskit-wire-v3.md`) over the same `Resolver` and `Engine`, plus the macOS mount driver. The daemon picks the front end in `internal/daemon/frontend_*.go`.
 - `internal/gitstore` is the performance-sensitive git wrapper; most easy-to-break invariants live there.
 - `internal/snapshot` and `internal/overlay` are persistent SQLite-backed stores.
 
@@ -40,7 +41,8 @@ Repository-specific guidance for `artifact-fs`.
 - For non-trivial code changes, reproduce CI in order: `go build ./cmd/artifact-fs`, `go vet ./...`, then `go test ./...`.
 - Build only the CLI with `go build ./cmd/artifact-fs`.
 - Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
-- FUSE e2e tests are opt-in: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -v .`. They require macFUSE on macOS or `/dev/fuse` on Linux.
+- FUSE e2e tests are opt-in and Linux-only: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -v .`. They require `/dev/fuse`.
+- On macOS, never run tests that mount (the root package's e2e tests, `internal/daemon`). Use `go test $(go list ./... | grep -v -e /internal/daemon -e 'artifact-fs$')`; `internal/fskit` tests the macOS front end with no mount.
 - E2E tests use a local bare repository by default. Set `AFS_E2E_REPO` only when intentionally testing a real remote.
 - E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -run TestE2EBenchmarkRepos -v .`.
 - Package tests live beside the code. Benchmarks and `e2e*_test.go` live in the root package.

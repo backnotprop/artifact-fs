@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -62,11 +63,42 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
+// DefaultBuild names this daemon build for the hello reply: the commit it
+// was built from, when Go recorded one.
+func DefaultBuild() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "artifact-fs"
+	}
+	rev, dirty := "", false
+	for _, kv := range info.Settings {
+		switch kv.Key {
+		case "vcs.revision":
+			rev = kv.Value
+		case "vcs.modified":
+			dirty = kv.Value == "true"
+		}
+	}
+	if rev == "" {
+		return "artifact-fs " + info.Main.Version
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if dirty {
+		rev += "-dirty"
+	}
+	return "artifact-fs " + rev
+}
+
 // NewServer returns a server for cfg. Call Serve with a listener.
 func NewServer(cfg Config) *Server {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.Build == "" {
+		cfg.Build = DefaultBuild()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{

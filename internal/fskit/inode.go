@@ -117,14 +117,28 @@ func (t *inodeTable) detach(path string, rec *removedItem) {
 }
 
 // move renames path oldPath, and everything mapped below it, to newPath.
-// Callers detach whatever was at newPath first.
+// Callers detach a replaced item first, with its data; anything still mapped
+// at or below newPath (a path a snapshot change removed) is retired here, so
+// no two numbers ever claim one path.
 func (t *inodeTable) move(oldPath, newPath string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	var moving []*inode
+	var moving, stale []*inode
 	for p, n := range t.byPath {
-		if p == oldPath || strings.HasPrefix(p, oldPath+"/") {
+		switch {
+		case p == oldPath || strings.HasPrefix(p, oldPath+"/"):
 			moving = append(moving, n)
+		case p == newPath || strings.HasPrefix(p, newPath+"/"):
+			stale = append(stale, n)
+		}
+	}
+	var free []*removedItem
+	for _, n := range stale {
+		delete(t.byPath, n.path)
+		n.path = ""
+		n.removed = &removedItem{attr: Attr{Ino: n.ino, Kind: n.kind}}
+		if !n.held {
+			delete(t.byIno, n.ino)
+			free = append(free, n.removed)
 		}
 	}
 	for _, n := range moving {
@@ -133,6 +147,10 @@ func (t *inodeTable) move(oldPath, newPath string) {
 	for _, n := range moving {
 		n.path = newPath + strings.TrimPrefix(n.path, oldPath)
 		t.byPath[n.path] = n
+	}
+	t.mu.Unlock()
+	for _, r := range free {
+		r.close()
 	}
 }
 
