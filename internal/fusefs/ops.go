@@ -125,6 +125,40 @@ func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
 	return err
 }
 
+// CreateExclusive creates a regular file and fails with fs.ErrExist when the
+// merged view already has the name. Unlike Create it never replaces an
+// existing entry; the FSKit front end needs this because FSKit, unlike the
+// Linux VFS, holds no directory lock across lookup and create.
+func (e *Engine) CreateExclusive(ctx context.Context, path string, mode uint32) (model.OverlayEntry, error) {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	return e.Overlay.CreateFileExclusive(ctx, path, mode, e.baseExists(ctx))
+}
+
+// MkdirExclusive is Mkdir with the EEXIST check of CreateExclusive.
+func (e *Engine) MkdirExclusive(ctx context.Context, path string, mode uint32) (model.OverlayEntry, error) {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	return e.Overlay.MkdirExclusive(ctx, path, mode, e.baseExists(ctx))
+}
+
+// SymlinkExclusive is Symlink with the EEXIST check of CreateExclusive.
+func (e *Engine) SymlinkExclusive(ctx context.Context, path string, target string) (model.OverlayEntry, error) {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	return e.Overlay.CreateSymlinkExclusive(ctx, path, target, e.baseExists(ctx))
+}
+
+// baseExists reports whether the current base snapshot has a path. Callers
+// hold the transition read lock so the generation cannot change underneath.
+func (e *Engine) baseExists(ctx context.Context) func(string) (bool, error) {
+	gen := e.Resolver.Generation()
+	return func(path string) (bool, error) {
+		_, ok, err := e.Resolver.Snapshot.LookupNode(ctx, gen, path)
+		return ok, err
+	}
+}
+
 func (e *Engine) Symlink(ctx context.Context, path string, target string) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()

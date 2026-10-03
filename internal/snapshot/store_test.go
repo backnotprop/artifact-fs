@@ -238,3 +238,51 @@ func TestNewDropsLegacyTables(t *testing.T) {
 	assertTableMissing("learned_path_stats")
 	assertTableMissing("blob_cache_index")
 }
+
+func TestDiffGenerations(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	g1, err := s.PublishGeneration(ctx, "h1", "main", []model.BaseNode{
+		{Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{Path: "same.txt", Type: "file", Mode: 0o100644, ObjectOID: "aaa", SizeState: "known"},
+		{Path: "edited.txt", Type: "file", Mode: 0o100644, ObjectOID: "bbb", SizeState: "known"},
+		{Path: "chmod.sh", Type: "file", Mode: 0o100644, ObjectOID: "ccc", SizeState: "known"},
+		{Path: "gone", Type: "dir", Mode: 0o40000, ObjectOID: "t1", SizeState: "known"},
+		{Path: "gone/x.txt", Type: "file", Mode: 0o100644, ObjectOID: "ddd", SizeState: "known"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g2, err := s.PublishGeneration(ctx, "h2", "main", []model.BaseNode{
+		{Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{Path: "same.txt", Type: "file", Mode: 0o100644, ObjectOID: "aaa", SizeState: "known"},
+		{Path: "edited.txt", Type: "file", Mode: 0o100644, ObjectOID: "bbb2", SizeState: "known"},
+		{Path: "chmod.sh", Type: "file", Mode: 0o100755, ObjectOID: "ccc", SizeState: "known"},
+		{Path: "added.md", Type: "file", Mode: 0o100644, ObjectOID: "eee", SizeState: "unknown"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff, err := s.DiffGenerations(ctx, g1, g2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range diff {
+		kind := "changed"
+		switch {
+		case c.Old == nil:
+			kind = "added"
+		case c.New == nil:
+			kind = "removed"
+		}
+		got = append(got, kind+" "+c.Path)
+	}
+	want := []string{"added added.md", "changed chmod.sh", "changed edited.txt", "removed gone", "removed gone/x.txt"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("diff = %v, want %v", got, want)
+	}
+	if diff[2].Old.ObjectOID != "bbb" || diff[2].New.ObjectOID != "bbb2" {
+		t.Fatalf("edited.txt change = %+v %+v", diff[2].Old, diff[2].New)
+	}
+}

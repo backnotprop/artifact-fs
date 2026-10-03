@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -166,6 +167,64 @@ func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseN
 		out = append(out, n)
 	}
 	return out, rows.Err()
+}
+
+// GenerationChange is one path that differs between two generations. Old is
+// nil for an added path and New is nil for a removed one.
+type GenerationChange struct {
+	Path string
+	Old  *model.BaseNode
+	New  *model.BaseNode
+}
+
+// DiffGenerations lists the paths whose type, mode or object differ between
+// two generations, sorted by path. Front ends that must replay a server-side
+// change (the FSKit write-through) use it.
+func (s *Store) DiffGenerations(ctx context.Context, oldGen, newGen int64) ([]GenerationChange, error) {
+	const cols = `n.path, n.type, n.mode, n.object_oid, n.size_state, n.size_bytes, o.type, o.mode, o.object_oid, o.size_state, o.size_bytes`
+	var out []GenerationChange
+	scan := func(rows *sql.Rows, removed bool) error {
+		defer rows.Close()
+		for rows.Next() {
+			var a model.BaseNode
+			var bType, bOID, bState sql.NullString
+			var bMode, bSize sql.NullInt64
+			if err := rows.Scan(&a.Path, &a.Type, &a.Mode, &a.ObjectOID, &a.SizeState, &a.SizeBytes, &bType, &bMode, &bOID, &bState, &bSize); err != nil {
+				return err
+			}
+			c := GenerationChange{Path: a.Path}
+			var b *model.BaseNode
+			if bType.Valid {
+				b = &model.BaseNode{Path: a.Path, Type: bType.String, Mode: uint32(bMode.Int64), ObjectOID: bOID.String, SizeState: bState.String, SizeBytes: bSize.Int64}
+			}
+			if removed {
+				c.Old = &a
+			} else {
+				c.New = &a
+				c.Old = b
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+cols+` FROM base_nodes n LEFT JOIN base_nodes o ON o.generation=? AND o.path=n.path
+		WHERE n.generation=? AND (o.path IS NULL OR o.type<>n.type OR o.mode<>n.mode OR o.object_oid<>n.object_oid)`, oldGen, newGen)
+	if err != nil {
+		return nil, err
+	}
+	if err := scan(rows, false); err != nil {
+		return nil, err
+	}
+	rows, err = s.db.QueryContext(ctx, `SELECT `+cols+` FROM base_nodes n LEFT JOIN base_nodes o ON o.generation=? AND o.path=n.path
+		WHERE n.generation=? AND o.path IS NULL`, newGen, oldGen)
+	if err != nil {
+		return nil, err
+	}
+	if err := scan(rows, true); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
 }
 
 // UpdateSize sets the size for a blob after hydration. Updates all rows with
