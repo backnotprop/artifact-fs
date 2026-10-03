@@ -3,7 +3,9 @@
 package fskit
 
 import (
+	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -70,7 +72,7 @@ func MountRepo(opts MountOptions) (*Mount, error) {
 	case extensionDisabled:
 		return nil, errExtensionDisabled("")
 	}
-	mountID := MountIDFor(string(cfg.ID))
+	mountID := MountIDForMount(cfg.Name, cfg.MountPath)
 	stateDir, err := PrepareStateDir(mountID, cfg.Name)
 	if err != nil {
 		return nil, fmt.Errorf("fskit state folder: %w", err)
@@ -284,33 +286,94 @@ const (
 	extensionNotRegistered
 )
 
-// extensionState asks pluginkit about the extension. Its listing prefixes a
-// plugin with "+" (on) or "-" (off); no line means not registered.
+// extensionState asks macOS whether the extension is registered and on.
+// pluginkit says whether it is registered; whether FSKit will mount with it
+// is FSKit's own per-person list (fskitEnabledList). pluginkit's "+" alone
+// is not enough: on macOS 26.3 a failed switch in System Settings leaves "+"
+// while FSKit still refuses ("Module ... is disabled!").
 func extensionState() extensionStatus {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "/usr/bin/pluginkit", "-m", "-i", ExtensionBundleID).Output()
+	var pk extensionStatus
 	if err != nil && len(out) == 0 {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return extensionNotRegistered
+		if !errors.As(err, &exitErr) {
+			return extensionUnknown
 		}
-		return extensionUnknown
+		pk = extensionNotRegistered
+	} else {
+		pk = parsePluginkit(string(out))
 	}
-	return parsePluginkit(string(out))
+	b, err := os.ReadFile(fskitEnabledList())
+	if err != nil {
+		return pk
+	}
+	return combineState(pk, b)
 }
 
+// fskitEnabledList is the file behind the switch in System Settings: the
+// FSKit modules this person turned on. Apple calls it an implementation
+// detail (developer forums thread 808594), so a file that cannot be read or
+// parsed leaves the answer to pluginkit.
+func fskitEnabledList() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "Group Containers", "group.com.apple.fskit.settings", "enabledModules.plist")
+}
+
+// combineState merges pluginkit's answer with FSKit's list (a plist file).
+func combineState(pk extensionStatus, list []byte) extensionStatus {
+	if pk == extensionNotRegistered || pk == extensionDisabled {
+		return pk
+	}
+	on, ok := plistHasString(list, ExtensionBundleID)
+	switch {
+	case !ok:
+		return pk
+	case on:
+		return extensionEnabled
+	}
+	return extensionDisabled
+}
+
+// plistHasString reports whether a plist holds s as a string. ok is false
+// when the file is not a plist this can read. FSKit writes the list as XML
+// today; a binary plist is converted with plutil.
+func plistHasString(b []byte, s string) (found, ok bool) {
+	if bytes.HasPrefix(b, []byte("bplist")) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "/usr/bin/plutil", "-convert", "xml1", "-o", "-", "-")
+		cmd.Stdin = bytes.NewReader(b)
+		out, err := cmd.Output()
+		if err != nil {
+			return false, false
+		}
+		b = out
+	}
+	if !bytes.Contains(b, []byte("<plist")) {
+		return false, false
+	}
+	var esc bytes.Buffer
+	_ = xml.EscapeText(&esc, []byte(s))
+	return bytes.Contains(b, []byte("<string>"+esc.String()+"</string>")), true
+}
+
+// parsePluginkit reads `pluginkit -m -i <id>`: a line per plugin with a flag
+// first, "+" (chosen) or "-" (turned off); a line with no flag has no choice
+// made, which is not proof of either.
 func parsePluginkit(out string) extensionStatus {
 	for line := range strings.SplitSeq(out, "\n") {
 		if !strings.Contains(line, ExtensionBundleID) {
 			continue
 		}
-		switch strings.TrimSpace(line)[0] {
-		case '-':
+		switch line[0] {
+		case '-', '!':
 			return extensionDisabled
-		default:
+		case '+', '=':
 			return extensionEnabled
 		}
+		return extensionUnknown
 	}
 	return extensionNotRegistered
 }
