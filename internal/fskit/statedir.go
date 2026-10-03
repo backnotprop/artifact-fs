@@ -38,6 +38,32 @@ func MountIDFor(repoID string) string {
 	return "m-" + hex.EncodeToString(sum[:8])
 }
 
+// MountIDForMount returns the mount id for a repo mounted at mountPoint: the
+// repo name (cut to 39 characters, other characters made '-') and 8 hex
+// digits of a hash of the mount point. The state root is one folder per
+// person, shared by every daemon, so two repos named the same (every
+// worktrees/main, say) must not share a socket.
+func MountIDForMount(name, mountPoint string) string {
+	if abs, err := filepath.Abs(mountPoint); err == nil {
+		mountPoint = abs
+	}
+	sum := sha256.Sum256([]byte(mountPoint))
+	b := []byte(name)
+	for i, c := range b {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			b[i] = '-'
+		}
+	}
+	base := strings.TrimLeft(string(b), "._-")
+	if len(base) > 39 {
+		base = base[:39]
+	}
+	if base == "" {
+		base = "m"
+	}
+	return base + "-" + hex.EncodeToString(sum[:4])
+}
+
 // ValidMountID reports whether id fits the contract's pattern.
 func ValidMountID(id string) bool { return mountIDPattern.MatchString(id) }
 

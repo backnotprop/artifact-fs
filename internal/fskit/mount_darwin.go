@@ -3,7 +3,9 @@
 package fskit
 
 import (
+	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -70,7 +72,7 @@ func MountRepo(opts MountOptions) (*Mount, error) {
 	case extensionDisabled:
 		return nil, errExtensionDisabled("")
 	}
-	mountID := MountIDFor(string(cfg.ID))
+	mountID := MountIDForMount(cfg.Name, cfg.MountPath)
 	stateDir, err := PrepareStateDir(mountID, cfg.Name)
 	if err != nil {
 		return nil, fmt.Errorf("fskit state folder: %w", err)
@@ -222,6 +224,10 @@ func explainMountError(mountPoint, output string, err error, state extensionStat
 		return fmt.Errorf("macOS refused to mount at %s (Operation not permitted). This is a privacy setting, not the extension. Mount somewhere under your home folder, or give your terminal Full Disk Access in System Settings > Privacy & Security > Full Disk Access and reopen it %s", mountPoint, detail)
 	case strings.Contains(output, "is disabled") || state == extensionDisabled:
 		return errExtensionDisabled(detail)
+	case state == extensionEnabled && strings.Contains(output, "extensionKit.errorDomain"):
+		// Seen on macOS 26.3 after Pando.app was installed or replaced:
+		// fskit_agent still holds the old copy and cannot start it.
+		return fmt.Errorf("macOS could not start the Pando extension, which happens when FSKit's agent still holds an older copy of Pando.app. Run killall -9 fskit_agent (it starts again by itself; no sudo), or log out and back in, then try again. Eject any other FSKit volume first, such as an exFAT or FAT drive %s", detail)
 	case state == extensionNotRegistered || strings.Contains(output, "Unable to invoke task") || strings.Contains(output, "unknown") || strings.Contains(output, "not supported"):
 		return errExtensionMissing(detail)
 	}
@@ -229,11 +235,11 @@ func explainMountError(mountPoint, output string, err error, state extensionStat
 }
 
 func errExtensionMissing(detail string) error {
-	return errors.New(strings.TrimSpace(fmt.Sprintf("the Pando file system extension is not installed. Open Pando.app once so macOS registers it, then turn on Pando in %s. To check: pluginkit -m -i %s %s", settingsPath, ExtensionBundleID, detail)))
+	return errors.New(strings.TrimSpace(fmt.Sprintf("macOS does not list the Pando file system extension. Open Pando.app once so macOS registers it (after replacing the app: pluginkit -a /Applications/Pando.app/Contents/Extensions/PandoExtension.appex), then turn on Pando in %s. To check: pluginkit -m -i %s %s", settingsPath, ExtensionBundleID, detail)))
 }
 
 func errExtensionDisabled(detail string) error {
-	return errors.New(strings.TrimSpace(fmt.Sprintf("the Pando file system extension is turned off. Turn on Pando in %s, then try again %s", settingsPath, detail)))
+	return errors.New(strings.TrimSpace(fmt.Sprintf("the Pando file system extension is turned off. Turn on Pando in %s (show the list By Category and click the info button; replacing Pando.app turns it off again), then try again %s", settingsPath, detail)))
 }
 
 // protectedFolder names the privacy-protected folder that holds path, if any.
@@ -284,33 +290,94 @@ const (
 	extensionNotRegistered
 )
 
-// extensionState asks pluginkit about the extension. Its listing prefixes a
-// plugin with "+" (on) or "-" (off); no line means not registered.
+// extensionState asks macOS whether the extension is registered and on.
+// pluginkit says whether it is registered; whether FSKit will mount with it
+// is FSKit's own per-person list (fskitEnabledList). pluginkit's "+" alone
+// is not enough: on macOS 26.3 a failed switch in System Settings leaves "+"
+// while FSKit still refuses ("Module ... is disabled!").
 func extensionState() extensionStatus {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "/usr/bin/pluginkit", "-m", "-i", ExtensionBundleID).Output()
+	var pk extensionStatus
 	if err != nil && len(out) == 0 {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return extensionNotRegistered
+		if !errors.As(err, &exitErr) {
+			return extensionUnknown
 		}
-		return extensionUnknown
+		pk = extensionNotRegistered
+	} else {
+		pk = parsePluginkit(string(out))
 	}
-	return parsePluginkit(string(out))
+	b, err := os.ReadFile(fskitEnabledList())
+	if err != nil {
+		return pk
+	}
+	return combineState(pk, b)
 }
 
+// fskitEnabledList is the file behind the switch in System Settings: the
+// FSKit modules this person turned on. Apple calls it an implementation
+// detail (developer forums thread 808594), so a file that cannot be read or
+// parsed leaves the answer to pluginkit.
+func fskitEnabledList() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "Group Containers", "group.com.apple.fskit.settings", "enabledModules.plist")
+}
+
+// combineState merges pluginkit's answer with FSKit's list (a plist file).
+func combineState(pk extensionStatus, list []byte) extensionStatus {
+	if pk == extensionNotRegistered || pk == extensionDisabled {
+		return pk
+	}
+	on, ok := plistHasString(list, ExtensionBundleID)
+	switch {
+	case !ok:
+		return pk
+	case on:
+		return extensionEnabled
+	}
+	return extensionDisabled
+}
+
+// plistHasString reports whether a plist holds s as a string. ok is false
+// when the file is not a plist this can read. FSKit writes the list as XML
+// today; a binary plist is converted with plutil.
+func plistHasString(b []byte, s string) (found, ok bool) {
+	if bytes.HasPrefix(b, []byte("bplist")) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "/usr/bin/plutil", "-convert", "xml1", "-o", "-", "-")
+		cmd.Stdin = bytes.NewReader(b)
+		out, err := cmd.Output()
+		if err != nil {
+			return false, false
+		}
+		b = out
+	}
+	if !bytes.Contains(b, []byte("<plist")) {
+		return false, false
+	}
+	var esc bytes.Buffer
+	_ = xml.EscapeText(&esc, []byte(s))
+	return bytes.Contains(b, []byte("<string>"+esc.String()+"</string>")), true
+}
+
+// parsePluginkit reads `pluginkit -m -i <id>`: a line per plugin with a flag
+// first, "+" (chosen) or "-" (turned off); a line with no flag has no choice
+// made, which is not proof of either.
 func parsePluginkit(out string) extensionStatus {
 	for line := range strings.SplitSeq(out, "\n") {
 		if !strings.Contains(line, ExtensionBundleID) {
 			continue
 		}
-		switch strings.TrimSpace(line)[0] {
-		case '-':
+		switch line[0] {
+		case '-', '!':
 			return extensionDisabled
-		default:
+		case '+', '=':
 			return extensionEnabled
 		}
+		return extensionUnknown
 	}
 	return extensionNotRegistered
 }
