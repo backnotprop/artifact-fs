@@ -32,6 +32,9 @@ import (
 
 const DefaultHydrationConcurrency = 4
 
+// The hydrator fetches queued misses together only through this interface.
+var _ hydrator.BatchFetcher = (*gitstore.Store)(nil)
+
 const (
 	defaultPrepareTimeout    = 30 * time.Minute
 	prepareStateWriteTimeout = 5 * time.Second

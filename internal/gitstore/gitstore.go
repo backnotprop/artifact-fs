@@ -1461,6 +1461,48 @@ func readBatchBlob(ctx context.Context, batch *batchCatFile, objectOID string, m
 	}
 }
 
+// FetchBlobs downloads, in one fetch request, the blobs among oids that the
+// clone does not have yet. On a blobless clone `cat-file --batch` would
+// otherwise run one lazy fetch per missing blob, and each request costs about
+// 0.65 s against Artifacts whatever it carries (1 blob 0.65 s, 100 blobs
+// 0.67 s, 1,000 blobs 1.7 s, measured 2026-10-04). It returns how many blobs
+// it asked the remote for. The fetch is the one git's own lazy fetch runs,
+// with the same environment, so the remote's credentials apply unchanged.
+func (s *Store) FetchBlobs(ctx context.Context, repo model.RepoConfig, oids []string) (int, error) {
+	missing, err := missingObjects(ctx, repo.GitDir, oids)
+	if err != nil || len(missing) == 0 {
+		return 0, err
+	}
+	input := strings.Join(missing, "\n") + "\n"
+	_, err = runGitInput(ctx, repo.GitDir, nil, strings.NewReader(input),
+		"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--quiet", "origin",
+		"--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin")
+	if err != nil {
+		return 0, err
+	}
+	return len(missing), nil
+}
+
+// missingObjects returns the oids the object store does not have, without
+// fetching any of them.
+func missingObjects(ctx context.Context, gitDir string, oids []string) ([]string, error) {
+	if len(oids) == 0 {
+		return nil, nil
+	}
+	input := strings.Join(oids, "\n") + "\n"
+	out, err := runGitInput(ctx, gitDir, []string{"GIT_NO_LAZY_FETCH=1"}, strings.NewReader(input), "cat-file", "--batch-check=%(objectname)", "--buffer")
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, line := range strings.Split(out, "\n") {
+		if oid, ok := strings.CutSuffix(strings.TrimSpace(line), " missing"); ok {
+			missing = append(missing, oid)
+		}
+	}
+	return missing, nil
+}
+
 func (s *Store) VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (bool, error) {
 	out, err := runGit(ctx, repo.GitDir, "hash-object", "--no-filters", cachePath)
 	if err != nil {
@@ -1943,7 +1985,17 @@ func runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []s
 }
 
 func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
+	return runGitCommand(ctx, gitDir, extraEnv, nil, captureOutput, args...)
+}
+
+// runGitInput runs git with stdin and returns its output.
+func runGitInput(ctx context.Context, gitDir string, extraEnv []string, stdin io.Reader, args ...string) (string, error) {
+	return runGitCommand(ctx, gitDir, extraEnv, stdin, true, args...)
+}
+
+func runGitCommand(ctx context.Context, gitDir string, extraEnv []string, stdin io.Reader, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Stdin = stdin
 	configureCancelableCommand(cmd)
 	env := os.Environ()
 	if gitDir != "" {

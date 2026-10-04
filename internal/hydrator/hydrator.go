@@ -503,63 +503,138 @@ func (s *Service) worker(repo model.RepoConfig) {
 	}
 }
 
-// step pops and processes one item from the queue. Returns true if an item
-// was processed, false if the queue was empty.
+// BatchFetcher downloads many blobs in one request. With it, the misses
+// queued at the same moment are fetched together: a request to the remote
+// costs about the same for 1 blob as for 100.
+type BatchFetcher interface {
+	FetchBlobs(ctx context.Context, repo model.RepoConfig, oids []string) (int, error)
+}
+
+// A batch stops at either cap, so one slow batch does not hold up the next
+// explicit read for long.
+const (
+	maxBatchBlobs = 500
+	maxBatchBytes = 64 << 20
+)
+
+// step takes the queued items one worker handles together: the first one,
+// and, when the fetcher can batch, every other queued item up to the caps.
+// Returns true if anything was taken, false if the queue was empty.
 func (s *Service) step(repo model.RepoConfig) bool {
+	items, ok := s.takeBatch()
+	if !ok {
+		return false
+	}
+	need := make([]*taskItem, 0, len(items))
+	for _, item := range items {
+		if !s.finishIfCached(repo, item) {
+			need = append(need, item)
+		}
+	}
+	if batcher, ok := s.fetcher.(BatchFetcher); ok && len(need) > 1 {
+		oids := make([]string, len(need))
+		for i, item := range need {
+			oids[i] = item.task.ObjectOID
+		}
+		// A failed batch is not an error of its own: each blob below then
+		// takes git's one-blob lazy fetch, which reports its own failure.
+		s.withFetchTimeout(func(ctx context.Context) { _, _ = batcher.FetchBlobs(ctx, repo, oids) })
+	}
+	for _, item := range need {
+		s.hydrate(repo, item)
+	}
+	return true
+}
+
+// takeBatch pops the highest-priority item and, when the fetcher batches,
+// more items up to the caps, marking each active.
+func (s *Service) takeBatch() ([]*taskItem, bool) {
 	s.mu.Lock()
 	if len(s.pq) == 0 {
 		s.mu.Unlock()
-		return false
+		return nil, false
 	}
-	item := heap.Pop(&s.pq).(*taskItem)
-	key := taskKey(item.task.RepoID, item.task.ObjectOID)
-	delete(s.queued, key)
-	if _, ok := s.active[key]; ok {
-		s.mu.Unlock()
-		return true
+	_, batching := s.fetcher.(BatchFetcher)
+	var items []*taskItem
+	var bytes int64
+	for len(s.pq) > 0 {
+		if len(items) > 0 && (!batching || len(items) >= maxBatchBlobs || bytes >= maxBatchBytes) {
+			break
+		}
+		item := heap.Pop(&s.pq).(*taskItem)
+		key := taskKey(item.task.RepoID, item.task.ObjectOID)
+		delete(s.queued, key)
+		if _, ok := s.active[key]; ok {
+			continue
+		}
+		s.active[key] = struct{}{}
+		items = append(items, item)
+		if item.task.SizeState == "known" {
+			bytes += item.task.SizeBytes
+		}
 	}
-	s.active[key] = struct{}{}
 	more := len(s.pq) > 0
 	s.mu.Unlock()
 	if more {
 		s.signalWork()
 	}
+	return items, true
+}
 
+// finishIfCached completes an item whose blob is already in the cache.
+func (s *Service) finishIfCached(repo model.RepoConfig, item *taskItem) bool {
+	key := taskKey(item.task.RepoID, item.task.ObjectOID)
 	cachePath := cachePathFor(repo, item.task.ObjectOID)
-	node := taskBaseNode(item.task)
-	if size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, node); err != nil {
-		s.finishHydration(key, result{err: err})
-		return true
-	} else if ok {
-		s.finishHydration(key, result{cachePath: cachePath, size: size})
-		s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
-		return true
-	}
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+	size, ok, err := s.validateCachedBlob(context.Background(), repo, cachePath, taskBaseNode(item.task))
+	if err != nil {
 		s.finishHydration(key, result{err: err})
 		return true
 	}
-	// Use a timeout context derived from stopCh so stuck blob fetches don't
-	// block a worker forever.
-	fetchCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if !ok {
+		return false
+	}
+	s.finishHydration(key, result{cachePath: cachePath, size: size})
+	s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
+	return true
+}
+
+// withFetchTimeout runs fn with a context that ends after 2 minutes or when
+// the service stops, so a stuck fetch does not block a worker forever.
+func (s *Service) withFetchTimeout(fn func(ctx context.Context)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	go func() {
 		select {
 		case <-s.stopCh:
 			cancel()
-		case <-fetchCtx.Done():
+		case <-ctx.Done():
 		}
 	}()
-	size, err := s.fetcher.BlobToCache(fetchCtx, repo, item.task.ObjectOID, cachePath)
+	fn(ctx)
+}
+
+// hydrate copies one blob into the cache and wakes everyone waiting on it.
+func (s *Service) hydrate(repo model.RepoConfig, item *taskItem) {
+	key := taskKey(item.task.RepoID, item.task.ObjectOID)
+	cachePath := cachePathFor(repo, item.task.ObjectOID)
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		s.finishHydration(key, result{err: err})
+		return
+	}
+	var size int64
+	var err error
+	s.withFetchTimeout(func(ctx context.Context) {
+		size, err = s.fetcher.BlobToCache(ctx, repo, item.task.ObjectOID, cachePath)
+	})
 	if err != nil {
 		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
-		return true
+		return
 	}
 	s.mu.Lock()
 	if s.stopped {
 		delete(s.active, key)
 		s.mu.Unlock()
-		return true
+		return
 	}
 	if st, statErr := os.Stat(cachePath); statErr == nil {
 		s.verified[key] = st
@@ -569,7 +644,6 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	s.mu.Unlock()
 	notifyWaiters(waits, result{cachePath: cachePath, size: size, err: nil})
 	s.notifyHydrated(item.task.RepoID, item.task.ObjectOID, size)
-	return true
 }
 
 func taskBaseNode(task model.HydrationTask) model.BaseNode {
