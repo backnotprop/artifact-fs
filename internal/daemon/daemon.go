@@ -2364,7 +2364,11 @@ func (s *Service) fillPaths(cfg *model.RepoConfig) {
 		cfg.OverlayDir = filepath.Join(s.root, "overlays", string(cfg.ID))
 	}
 	if cfg.BlobCacheDir == "" {
-		cfg.BlobCacheDir = filepath.Join(s.root, "cache", "blobs", string(cfg.ID))
+		// One cache for every repo of this daemon root: blobs are named by
+		// id, so worktrees of one repository download a file once, not once
+		// each. Writes are a temp file and a rename, and a cache hit is
+		// checked against the blob id before first use.
+		cfg.BlobCacheDir = filepath.Join(s.root, "cache", "objects")
 	}
 	if cfg.MetaDBPath == "" {
 		cfg.MetaDBPath = filepath.Join(s.root, "meta", string(cfg.ID)+".sqlite")
