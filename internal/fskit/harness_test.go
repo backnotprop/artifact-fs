@@ -22,6 +22,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
+	"github.com/cloudflare/artifact-fs/internal/remotesize"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
@@ -38,14 +39,21 @@ type harness struct {
 	snap  *snapshot.Store
 	res   *fusefs.Resolver
 	gen   int64
-	work  string            // the remote's working copy
-	files map[string]string // base files and their content
+	work  string             // the remote's working copy
+	files map[string]string  // base files and their content
+	sizes *remotesize.Source // with remoteSizes
 }
 
 type harnessOptions struct {
 	readOnly bool
 	wrap     func(model.Hydrator) model.Hydrator
 	extra    func(work string) // add files to the remote before it is pushed
+	// sizesUnknown publishes the snapshot without file sizes, as when the
+	// snapshot's own size lookup ran out of time; remoteSizes gives the
+	// engine a remotesize.Source, and objectInfo lets the remote answer it.
+	sizesUnknown bool
+	remoteSizes  bool
+	objectInfo   bool
 }
 
 func gitRun(t *testing.T, dir string, args ...string) string {
@@ -104,6 +112,9 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	gitRun(t, work, "remote", "add", "origin", bare)
 	gitRun(t, work, "push", "-q", "origin", "main")
 	gitRun(t, bare, "config", "uploadpack.allowFilter", "true")
+	if opts.objectInfo {
+		gitRun(t, bare, "config", "transfer.advertiseObjectInfo", "true")
+	}
 
 	state := filepath.Join(tmp, "state")
 	cfg := model.RepoConfig{
@@ -136,6 +147,13 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if opts.sizesUnknown {
+		for i := range nodes {
+			if nodes[i].Type == "file" || nodes[i].Type == "symlink" {
+				nodes[i].SizeState, nodes[i].SizeBytes = "unknown", 0
+			}
+		}
+	}
 	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
 	if err != nil {
 		t.Fatal(err)
@@ -163,6 +181,11 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		resolver.SetCommitTime(ts)
 	}
 	engine := &fusefs.Engine{Resolver: resolver, Repo: cfg, Overlay: ov, Hydrator: hyd}
+	var sizes *remotesize.Source
+	if opts.remoteSizes {
+		sizes = remotesize.New(git, cfg, snap, resolver.Generation, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		engine.Sizes = sizes
+	}
 	srv := NewServer(Config{
 		Repo:       cfg,
 		Resolver:   resolver,
@@ -185,7 +208,23 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
-	return &harness{t: t, srv: srv, sock: sock, repo: cfg, ov: ov, h: h, git: git, snap: snap, res: resolver, gen: gen, work: work, files: files}
+	return &harness{t: t, srv: srv, sock: sock, repo: cfg, ov: ov, h: h, git: git, snap: snap, res: resolver, gen: gen, work: work, files: files, sizes: sizes}
+}
+
+// downloaded counts the blobs the hydrator has fetched into the cache.
+func (h *harness) downloaded() int {
+	h.t.Helper()
+	ents, err := os.ReadDir(h.repo.BlobCacheDir)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	n := 0
+	for _, e := range ents {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			n++
+		}
+	}
+	return n
 }
 
 // wireClient is an in-process client of the wire, built the way the

@@ -256,6 +256,44 @@ func (s *Store) UpdateSizes(ctx context.Context, generation int64, sizes map[str
 	return tx.Commit()
 }
 
+// KnownSizes is every blob size the generation knows, by object id, so a new
+// generation need not ask the remote again for blobs it shares.
+func (s *Store) KnownSizes(ctx context.Context, generation int64) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT object_oid, size_bytes FROM base_nodes WHERE generation=? AND size_state='known' AND object_oid!='' AND type IN ('file','symlink')`, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var oid string
+		var size int64
+		if err := rows.Scan(&oid, &size); err != nil {
+			return nil, err
+		}
+		out[oid] = size
+	}
+	return out, rows.Err()
+}
+
+// UnknownSizeOIDs is the blob ids whose size the generation still lacks.
+func (s *Store) UnknownSizeOIDs(ctx context.Context, generation int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT object_oid FROM base_nodes WHERE generation=? AND size_state!='known' AND object_oid!='' AND type IN ('file','symlink')`, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var oid string
+		if err := rows.Scan(&oid); err != nil {
+			return nil, err
+		}
+		out = append(out, oid)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) nextGenerationTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 	gen, ok, err := stateInt64(ctx, tx, "current_generation")
 	if err != nil {

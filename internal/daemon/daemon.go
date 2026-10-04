@@ -24,6 +24,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/registry"
+	"github.com/cloudflare/artifact-fs/internal/remotesize"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 	"github.com/cloudflare/artifact-fs/internal/watcher"
 	"golang.org/x/sys/unix"
@@ -116,6 +117,7 @@ type repoRuntime struct {
 	overlay  *overlay.Store
 	hydrator *hydrator.Service
 	sizes    *sizeUpdateBatcher
+	remote   *remotesize.Source
 	resolver *fusefs.Resolver
 	engine   *fusefs.Engine
 	mfs      fusefs.MountedFS
@@ -1026,11 +1028,13 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		sizes.Add(resolver.Generation(), objectOID, size)
 	})
 	h.Start(s.hydrationWorkers(), cfg)
+	remote := remotesize.New(s.git, cfg, snap, resolver.Generation, s.logger)
 	engine := &fusefs.Engine{
 		Resolver: resolver,
 		Repo:     cfg,
 		Overlay:  ov,
 		Hydrator: h,
+		Sizes:    remote,
 	}
 
 	mfs, err := s.mountFrontEnd(cfg, resolver, engine, nil)
@@ -1048,6 +1052,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		overlay:  ov,
 		hydrator: h,
 		sizes:    sizes,
+		remote:   remote,
 		resolver: resolver,
 		engine:   engine,
 		mfs:      mfs,
@@ -1096,11 +1101,13 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	if cfg.PrepareState == model.PrepareStateFailed {
 		gate.MarkFailed(prepareGateError(cfg.PrepareError))
 	}
+	remote := remotesize.New(s.git, cfg, snap, resolver.Generation, s.logger)
 	engine := &fusefs.Engine{
 		Resolver: resolver,
 		Repo:     cfg,
 		Overlay:  ov,
 		Hydrator: h,
+		Sizes:    remote,
 	}
 
 	mfs, err := s.mountFrontEnd(cfg, resolver, engine, gate)
@@ -1120,6 +1127,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		overlay:  ov,
 		hydrator: h,
 		sizes:    sizes,
+		remote:   remote,
 		resolver: resolver,
 		engine:   engine,
 		mfs:      mfs,
@@ -1672,6 +1680,7 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 		setHeadState(&rt.state, oid, ref, gen)
 	}
 	s.mu.Unlock()
+	rt.remote.Kick()
 	if err := rt.snapshot.PruneGenerations(ctx, min(prevGen, gen-1)); err != nil {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
@@ -1933,7 +1942,13 @@ func applySourceStatus(st *model.RepoRuntimeState, cfg model.RepoConfig) {
 }
 
 func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
-	nodes, err := s.git.BuildTreeIndex(ctx, cfg, oid)
+	// Sizes the current snapshot knows carry over, so the remote is asked
+	// only for blobs new to this one.
+	var known map[string]int64
+	if cur, err := snap.CurrentGeneration(ctx); err == nil && cur > 0 {
+		known, _ = snap.KnownSizes(ctx, cur)
+	}
+	nodes, err := s.git.BuildTreeIndexKnowing(ctx, cfg, oid, known)
 	if err != nil {
 		return 0, snapshotPhaseBuild, err
 	}
@@ -2136,9 +2151,9 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 	rt.active = true
 	gitDir := rt.cfg.GitDir
 	fixedBase := rt.cfg.RequiredCommit != ""
-	workerCount := 2
+	workerCount := 3
 	if fixedBase {
-		workerCount = 1
+		workerCount = 2
 	}
 	rt.workers.Add(workerCount)
 	s.mu.Unlock()
@@ -2146,6 +2161,12 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 	go func() {
 		defer rt.workers.Done()
 		s.refreshLoop(rt)
+	}()
+	// Sizes the snapshot still lacks are asked for in the background, so a
+	// listing finds them known instead of asking or downloading.
+	go func() {
+		defer rt.workers.Done()
+		rt.remote.Run(rt.ctx)
 	}()
 
 	if !fixedBase {

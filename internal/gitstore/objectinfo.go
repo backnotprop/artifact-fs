@@ -34,13 +34,21 @@ import (
 
 var errObjectInfoUnsupported = errors.New("remote does not offer object-info")
 
-// objectInfoBatch caps the object IDs in one request (about 460 KiB), under
-// git's default http.postBuffer so each request is one plain POST.
-const objectInfoBatch = 10000
+// objectInfoBatch caps the object IDs in one request. Pando's door learns a
+// cold size from one fetch per 1,000 blobs (about 1.7 s on a real-sized
+// repository), so a request of this size answers well inside a minute, and
+// what a later request fails to learn does not lose what earlier ones did.
+var objectInfoBatch = 1000
 
-// remoteSizeTimeout bounds the whole size lookup so a slow remote delays a
-// snapshot by at most this long; sizes then resolve on demand.
-const remoteSizeTimeout = 2 * time.Minute
+// remoteSizeTimeout bounds the size lookup a new snapshot waits for, so a
+// slow remote delays a mount by at most this long. The sizes still unknown
+// are then asked for in the background and per folder listed (the daemon's
+// remotesize source, through RemoteBlobSizes).
+const remoteSizeTimeout = 30 * time.Second
+
+// objectInfoBatchTimeout bounds one request of objectInfoBatch ids, so one
+// slow request ends the lookup and keeps what earlier requests learned.
+var objectInfoBatchTimeout = 30 * time.Second
 
 const (
 	pktFlush       = "0000"
@@ -56,8 +64,20 @@ type v2Session interface {
 	close() error
 }
 
-// remoteBlobSizes returns sizes for the given blob IDs from the remote. A size
-// the remote does not know is left out of the map.
+// RemoteBlobSizes returns sizes for the given blob IDs from the remote's
+// object-info, without downloading the blobs. A size the remote does not know
+// is left out of the map. On an error it returns what earlier batches learned
+// with the error; IsObjectInfoUnsupported tells a remote that cannot answer.
+func (s *Store) RemoteBlobSizes(ctx context.Context, repo model.RepoConfig, oids []string) (map[string]int64, error) {
+	return s.remoteBlobSizes(ctx, repo, oids)
+}
+
+// IsObjectInfoUnsupported reports whether err means the remote has no
+// object-info, so asking again cannot help.
+func IsObjectInfoUnsupported(err error) bool {
+	return errors.Is(err, errObjectInfoUnsupported)
+}
+
 func (s *Store) remoteBlobSizes(ctx context.Context, repo model.RepoConfig, oids []string) (map[string]int64, error) {
 	if len(oids) == 0 {
 		return nil, nil
@@ -95,12 +115,17 @@ func (s *Store) remoteBlobSizes(ctx context.Context, repo model.RepoConfig, oids
 	sizes := make(map[string]int64, len(oids))
 	for start := 0; start < len(oids); start += objectInfoBatch {
 		batch := oids[start:min(start+objectInfoBatch, len(oids))]
-		lines, err := session.call(ctx, objectInfoRequest(objectFormat, batch))
+		callCtx, cancel := context.WithTimeout(ctx, objectInfoBatchTimeout)
+		lines, err := session.call(callCtx, objectInfoRequest(objectFormat, batch))
+		if err != nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			err = fmt.Errorf("object-info for %d ids took over %s: %w", len(batch), objectInfoBatchTimeout, err)
+		}
+		cancel()
 		if err != nil {
-			return nil, err
+			return sizes, err
 		}
 		if err := parseObjectInfo(lines, sizes); err != nil {
-			return nil, err
+			return sizes, err
 		}
 	}
 	return sizes, nil
@@ -224,7 +249,12 @@ func openHelperSession(ctx context.Context, gitDir string, scheme string, remote
 
 func (h *helperSession) capabilities() []string { return h.caps }
 
-func (h *helperSession) call(_ context.Context, request []byte) ([]string, error) {
+func (h *helperSession) call(ctx context.Context, request []byte) ([]string, error) {
+	// A call's own deadline ends the helper's process group (git runs the
+	// real helper, git-remote-http, as a child that holds the pipe), and
+	// with it this call.
+	stop := context.AfterFunc(ctx, func() { _ = killCommandProcessGroup(h.cmd) })
+	defer stop()
 	if _, err := h.stdin.Write(request); err != nil {
 		return nil, h.fail(err)
 	}
@@ -381,9 +411,8 @@ func (s *Store) resolveRemoteSizes(ctx context.Context, repo model.RepoConfig, n
 		if errors.Is(err, errObjectInfoUnsupported) {
 			s.logger.Debug("remote has no object-info; unknown file sizes resolve on demand", "repo", repo.Name)
 		} else {
-			s.logger.Warn("remote size lookup failed; unknown file sizes resolve on demand", "repo", repo.Name, "error", auth.RedactString(err.Error()))
+			s.logger.Warn("remote size lookup stopped; the sizes still unknown resolve on demand", "repo", repo.Name, "learned", len(sizes), "missing", len(missing), "error", auth.RedactString(err.Error()))
 		}
-		return nil
 	}
 	for oid, size := range sizes {
 		for _, idx := range index[oid] {
