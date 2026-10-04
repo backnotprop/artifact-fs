@@ -87,3 +87,70 @@ func countPacks(t *testing.T, gitDir string) int {
 	}
 	return len(packs)
 }
+
+// Many one-blob downloads at once, on a clone with a commit-graph as the
+// daemon's have: every read succeeds (git's automatic repack used to swap
+// packs under running fetches), and the store keeps the packs merged.
+func TestConcurrentDownloadsKeepPacksMergedWithoutFailures(t *testing.T) {
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+	run(t, "git", "init", "--bare", "-b", "main", bare)
+	run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
+	run(t, "git", "init", "-b", "main", work)
+	const files = 240
+	for i := range files {
+		if err := os.WriteFile(filepath.Join(work, fmt.Sprintf("f%03d.txt", i)), []byte(fmt.Sprintf("file %d\n", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(t, "git", "-C", work, "add", ".")
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "files")
+	run(t, "git", "-C", work, "push", "-q", bare, "main")
+	clone := filepath.Join(tmp, "clone.git")
+	run(t, "git", "clone", "-q", "--bare", "--filter=blob:none", "file://"+bare, clone)
+	run(t, "git", "--git-dir", clone, "commit-graph", "write", "--reachable")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := configureArtifactWorktree(ctx, clone); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(runOutput(t, "git", "--git-dir", clone, "config", "maintenance.auto")); got != "false" {
+		t.Fatalf("maintenance.auto = %q, want false", got)
+	}
+	var oids []string
+	for _, line := range strings.Split(strings.TrimSpace(runOutput(t, "git", "--git-dir", clone, "ls-tree", "HEAD")), "\n") {
+		oids = append(oids, strings.Fields(line)[2])
+	}
+
+	store := New(nil)
+	defer store.Close()
+	store.SetBatchPoolSize(8)
+	cfg := model.RepoConfig{ID: "r", GitDir: clone}
+	cache := filepath.Join(tmp, "cache")
+	work8 := make(chan string)
+	errs := make(chan error, files)
+	for range 8 {
+		go func() {
+			for oid := range work8 {
+				_, err := store.BlobToCache(ctx, cfg, oid, filepath.Join(cache, oid))
+				errs <- err
+			}
+		}()
+	}
+	for _, oid := range oids {
+		work8 <- oid
+	}
+	close(work8)
+	for range files {
+		if err := <-errs; err != nil {
+			t.Errorf("BlobToCache: %v", err)
+		}
+	}
+	if missing := countMissing(t, clone, oids); missing != 0 {
+		t.Fatalf("missing = %d, want 0", missing)
+	}
+	if packs := countPacks(t, clone); packs > maxPacks+1 {
+		t.Fatalf("packs = %d, want at most %d", packs, maxPacks+1)
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
@@ -484,7 +485,7 @@ func configureArtifactWorktree(ctx context.Context, gitDir string) error {
 			return err
 		}
 	}
-	return nil
+	return configureMaintenance(ctx, gitDir)
 }
 
 func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
@@ -1360,6 +1361,16 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	if err != nil {
 		return 0, err
 	}
+	pool.duringFetch(func() { size, err = blobToCache(ctx, pool, objectOID, dstPath) })
+	if err == nil {
+		s.mergePacks(repo.GitDir, pool)
+	}
+	return size, err
+}
+
+// blobToCache copies a blob through a pooled cat-file process, which fetches
+// it first when the clone lacks it.
+func blobToCache(ctx context.Context, pool *batchPool, objectOID string, dstPath string) (size int64, err error) {
 	batch, err := pool.acquire(ctx)
 	if err != nil {
 		return 0, err
@@ -1469,17 +1480,25 @@ func readBatchBlob(ctx context.Context, batch *batchCatFile, objectOID string, m
 // it asked the remote for. The fetch is the one git's own lazy fetch runs,
 // with the same environment, so the remote's credentials apply unchanged.
 func (s *Store) FetchBlobs(ctx context.Context, repo model.RepoConfig, oids []string) (int, error) {
-	missing, err := missingObjects(ctx, repo.GitDir, oids)
-	if err != nil || len(missing) == 0 {
-		return 0, err
-	}
-	input := strings.Join(missing, "\n") + "\n"
-	_, err = runGitInput(ctx, repo.GitDir, nil, strings.NewReader(input),
-		"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--quiet", "origin",
-		"--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin")
+	pool, err := s.getPool(repo.GitDir)
 	if err != nil {
 		return 0, err
 	}
+	var missing []string
+	pool.duringFetch(func() {
+		missing, err = missingObjects(ctx, repo.GitDir, oids)
+		if err != nil || len(missing) == 0 {
+			return
+		}
+		input := strings.Join(missing, "\n") + "\n"
+		_, err = runGitInput(ctx, repo.GitDir, nil, strings.NewReader(input),
+			"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--quiet", "origin",
+			"--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin")
+	})
+	if err != nil {
+		return 0, err
+	}
+	s.mergePacks(repo.GitDir, pool)
 	return len(missing), nil
 }
 
@@ -1537,6 +1556,8 @@ type batchPool struct {
 	all      map[*batchCatFile]struct{}
 	closed   bool
 	changed  chan struct{}
+	packs    sync.RWMutex // read: a fetch may run; write: packs are being merged
+	merging  atomic.Bool
 }
 
 func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
@@ -1941,6 +1962,10 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 	// folder for untracked files: on a 50,000-entry FSKit mount it went from
 	// 160 s to 0.1 s (the first run builds the cache).
 	if _, err := runGit(ctx, repo.GitDir, "config", "core.untrackedCache", "true"); err != nil {
+		return err
+	}
+	// Clones made by an older daemon still run git's automatic maintenance.
+	if err := configureMaintenance(ctx, repo.GitDir); err != nil {
 		return err
 	}
 	// Git adds the fsmonitor extension on the next porcelain index read. The
