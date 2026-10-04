@@ -132,6 +132,12 @@ type errNoBrowseUnavailable struct{ reason string }
 
 func (e errNoBrowseUnavailable) Error() string { return e.reason }
 
+// errNotLoaded means FSKit refused the resource and added no volume, so a
+// /sbin/mount attempt cannot end up mounted twice.
+type errNotLoaded struct{ reason string }
+
+func (e errNotLoaded) Error() string { return "FSKit loading failed: " + e.reason }
+
 // mountNoBrowse mounts the FSKit volume for stateDir at mountPoint with
 // nobrowse. Like /sbin/mount, it uses the mount point's real path.
 func mountNoBrowse(stateDir, mountPoint string, timeout time.Duration) error {
@@ -149,8 +155,11 @@ func mountNoBrowse(stateDir, mountPoint string, timeout time.Duration) error {
 	msg := C.GoString(res)
 	C.free(unsafe.Pointer(res))
 	step, detail, _ := strings.Cut(msg, "|")
-	if step == "0" {
+	switch step {
+	case "0":
 		return errNoBrowseUnavailable{detail}
+	case "1":
+		return errNotLoaded{detail}
 	}
 	what := map[string]string{"1": "loading", "2": "activating", "3": "mounting"}[step]
 	return fmt.Errorf("FSKit %s failed: %s", what, detail)

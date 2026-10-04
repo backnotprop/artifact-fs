@@ -4,11 +4,14 @@ package fskit
 
 import (
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // These tests cover the driver's decisions only. Nothing here runs
@@ -152,5 +155,69 @@ func TestMountIDForMount(t *testing.T) {
 		if got := MountIDForMount(name, "/tmp/m"); !ValidMountID(got) {
 			t.Fatalf("MountIDForMount(%q) = %q", name, got)
 		}
+	}
+}
+
+// /sbin/mount runs only when FSKit loaded nothing. After a later failure or
+// a timeout, FSKit may still finish mounting, so a second mount must never
+// be tried, whichever of the two timers fires first.
+func TestMountFallsBackOnlyWhenNothingWasLoaded(t *testing.T) {
+	const timeout = 10 * time.Millisecond
+	cases := []struct {
+		name     string
+		noBrowse func(string, string, time.Duration) error
+		wantSbin bool
+		wantErr  bool
+	}{
+		{"mounted", func(string, string, time.Duration) error { return nil }, false, false},
+		{"classes missing", func(string, string, time.Duration) error { return errNoBrowseUnavailable{"no classes"} }, true, false},
+		{"load refused", func(string, string, time.Duration) error { return errNotLoaded{"disabled"} }, true, false},
+		{"activate failed", func(string, string, time.Duration) error { return errors.New("FSKit activating failed: busy") }, false, true},
+		{"mount refused", func(string, string, time.Duration) error {
+			return errors.New("FSKit mounting failed: Operation not permitted")
+		}, false, true},
+		// The inner activate deadline and the outer timer race: the inner one
+		// answers at the same moment the outer one fires.
+		{"inner timeout at the deadline", func(_, _ string, d time.Duration) error {
+			time.Sleep(d)
+			return errors.New("FSKit activating failed: FSKit did not activate the volume in time")
+		}, false, true},
+		// Stuck past the deadline, then an answer that alone would allow the
+		// fallback: too late, it is ignored.
+		{"stuck, then refused", func(_, _ string, d time.Duration) error {
+			time.Sleep(3 * d)
+			return errNotLoaded{"late"}
+		}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for range 10 {
+				var mu sync.Mutex
+				sbinCalls := 0
+				m := mounter{
+					noBrowse: tc.noBrowse,
+					sbin: func(string, string) error {
+						mu.Lock()
+						sbinCalls++
+						mu.Unlock()
+						return nil
+					},
+					state:   func() extensionStatus { return extensionEnabled },
+					timeout: timeout,
+					log:     slog.New(slog.DiscardHandler),
+				}
+				err := m.mount("/tmp/state", "/tmp/pando-x")
+				time.Sleep(4 * timeout) // a late answer has time to arrive
+				mu.Lock()
+				calls := sbinCalls
+				mu.Unlock()
+				if (calls > 0) != tc.wantSbin || calls > 1 {
+					t.Fatalf("/sbin/mount ran %d times, want it to run: %v", calls, tc.wantSbin)
+				}
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("mount error = %v, want an error: %v", err, tc.wantErr)
+				}
+			}
+		})
 	}
 }
