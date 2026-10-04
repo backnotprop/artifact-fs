@@ -107,7 +107,7 @@ func MountRepo(opts MountOptions) (*Mount, error) {
 			log.Warn("fskit: socket server stopped", "repo", cfg.Name, "error", err)
 		}
 	}()
-	if err := runMount(stateDir, cfg.MountPath); err != nil {
+	if err := runMount(stateDir, cfg.MountPath, log); err != nil {
 		srv.Close()
 		return nil, err
 	}
@@ -193,11 +193,36 @@ func mountState(path string) (mounted, known bool) {
 	return st.Dev != parent.Dev, true
 }
 
-// runMount brings up the volume. FSKit path-URL volumes cannot be mounted
-// through DiskArbitration, so the daemon calls /sbin/mount itself; only
-// standard -o options reach FSKit, and the extension derives the mount id and
-// socket from the state folder it receives as its resource.
-func runMount(stateDir, mountPoint string) error {
+// runMount brings up the volume, hidden from the Desktop and Finder's
+// sidebar (nobrowse; see nobrowse_darwin.go). When that way is not available
+// or fails, it runs /sbin/mount, whose volume works the same but shows as a
+// drive. The extension derives the mount id and socket from the state folder
+// it receives as its resource.
+func runMount(stateDir, mountPoint string, log *slog.Logger) error {
+	done := make(chan error, 1)
+	go func() { done <- mountNoBrowse(stateDir, mountPoint, mountTimeout) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			return nil
+		}
+		var unavailable errNoBrowseUnavailable
+		if errors.As(err, &unavailable) {
+			log.Warn("fskit: mounting with /sbin/mount; the volume will show on the Desktop", "mount", mountPoint, "reason", err)
+		} else {
+			log.Warn("fskit: the nobrowse mount failed; trying /sbin/mount", "mount", mountPoint, "error", err)
+		}
+	case <-time.After(mountTimeout):
+		// FSKit's load call has no timeout of its own. The stuck call is left
+		// behind; /sbin/mount is not tried, as both could end up mounted.
+		return fmt.Errorf("mounting %s timed out after %s. Check that Pando.app is installed and the Pando extension is on in %s. If it is, run killall -9 fskit_agent (it starts again by itself) and try again", mountPoint, mountTimeout, settingsPath)
+	}
+	return runSbinMount(stateDir, mountPoint)
+}
+
+// runSbinMount mounts with /sbin/mount. Its -o nobrowse is dropped by macOS
+// 26.3 but asked for anyway, for a macOS that honours it.
+func runSbinMount(stateDir, mountPoint string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), mountTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/sbin/mount", "-F", "-t", FSShortName, "-o", "nobrowse", stateDir, mountPoint)
