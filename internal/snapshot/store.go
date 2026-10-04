@@ -150,10 +150,16 @@ func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (
 }
 
 // ListChildren returns direct children of parentPath using a path-based lookup
-// (no inode join, no collision risk).
+// (no inode join, no collision risk), sorted by path.
+//
+// The sort is done here, not with ORDER BY path: with it SQLite walks the
+// primary key (generation, path) through the whole generation instead of
+// the (generation, parent_path) index. On a 50,000-entry snapshot that made
+// every folder listing 8 ms idle and 87 ms under load (0.1 ms with the
+// index), and the first git status lists every folder (measured 2026-10-04).
 func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseNode, error) {
 	pp := model.CleanPath(parentPath)
-	rows, err := s.db.Query(`SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=? ORDER BY path`, generation, pp)
+	rows, err := s.db.Query(listChildrenSQL, generation, pp)
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +172,11 @@ func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseN
 		}
 		out = append(out, n)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, rows.Err()
 }
+
+const listChildrenSQL = `SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=?`
 
 // GenerationChange is one path that differs between two generations. Old is
 // nil for an added path and New is nil for a removed one.
