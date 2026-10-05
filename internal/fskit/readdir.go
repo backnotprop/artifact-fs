@@ -250,11 +250,29 @@ func (s *Server) opReaddir(ctx context.Context, req *request) (*reply, error) {
 	return &reply{Entries: &entries, Verifier: l.verifier, EOF: &eof}, nil
 }
 
-// fillListingSizes downloads the blobs whose size is unknown for one page,
-// a few at a time, without holding the namespace lock.
+// fillListingSizes fills the sizes the snapshot lacks for one page, without
+// holding the namespace lock: first with one remote lookup for the whole
+// page, then, for any the remote did not answer, by downloading the blobs a
+// few at a time.
 func (s *Server) fillListingSizes(ctx context.Context, l *listing, entries []DirEntry, needs []int) error {
 	if len(needs) == 0 {
 		return nil
+	}
+	if s.eng != nil && s.eng.Sizes != nil {
+		oids := make([]string, 0, len(needs))
+		for _, idx := range needs {
+			oids = append(oids, l.children[entries[idx].NextCookie-3].need.ObjectOID)
+		}
+		sizes := s.eng.Sizes.BlobSizes(ctx, oids)
+		rest := needs[:0]
+		for _, idx := range needs {
+			if size, ok := sizes[l.children[entries[idx].NextCookie-3].need.ObjectOID]; ok {
+				entries[idx].Attr.Size = uint64(size)
+			} else {
+				rest = append(rest, idx)
+			}
+		}
+		needs = rest
 	}
 	sem := make(chan struct{}, sizeFillWorkers)
 	var wg sync.WaitGroup
@@ -265,7 +283,7 @@ func (s *Server) fillListingSizes(ctx context.Context, l *listing, entries []Dir
 		go func() {
 			defer func() { <-sem; wg.Done() }()
 			child := l.children[entries[idx].NextCookie-3]
-			errs[i] = s.fillSize(ctx, entries[idx].Attr, child.need)
+			errs[i] = s.downloadSize(ctx, entries[idx].Attr, child.need)
 		}()
 	}
 	wg.Wait()

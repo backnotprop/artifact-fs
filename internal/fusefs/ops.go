@@ -22,6 +22,26 @@ type Engine struct {
 	Repo     model.RepoConfig
 	Overlay  model.OverlayStore
 	Hydrator model.Hydrator
+	// Sizes, when set, learns sizes the snapshot lacks from the remote, so
+	// a listing or stat does not download a file to learn its size.
+	Sizes SizeSource
+}
+
+// SizeSource answers blob sizes without downloading the blobs (git's
+// object-info). It returns the sizes it learned, and nothing when it cannot
+// ask; the caller then downloads the blob, since a wrong size would be cached
+// by the kernel and cut reads short.
+type SizeSource interface {
+	BlobSizes(ctx context.Context, oids []string) map[string]int64
+}
+
+// RemoteSize is the size of a base file or symlink from Sizes, if it knows.
+func (e *Engine) RemoteSize(ctx context.Context, b model.BaseNode) (int64, bool) {
+	if e == nil || e.Sizes == nil || b.ObjectOID == "" {
+		return 0, false
+	}
+	size, ok := e.Sizes.BlobSizes(ctx, []string{b.ObjectOID})[b.ObjectOID]
+	return size, ok
 }
 
 // ensureOverlay promotes a base file to the overlay (hydrate → copy-on-write).

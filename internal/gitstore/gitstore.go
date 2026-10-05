@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
@@ -484,7 +485,7 @@ func configureArtifactWorktree(ctx context.Context, gitDir string) error {
 			return err
 		}
 	}
-	return nil
+	return configureMaintenance(ctx, gitDir)
 }
 
 func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
@@ -1090,6 +1091,12 @@ func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid str
 }
 
 func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headOID string) ([]model.BaseNode, error) {
+	return s.BuildTreeIndexKnowing(ctx, repo, headOID, nil)
+}
+
+// BuildTreeIndexKnowing is BuildTreeIndex with blob sizes already known (an
+// earlier snapshot's), so the remote is asked only for the rest.
+func (s *Store) BuildTreeIndexKnowing(ctx context.Context, repo model.RepoConfig, headOID string, known map[string]int64) ([]model.BaseNode, error) {
 	// -z: NUL-delimited output with raw paths (no C-quoting of non-ASCII names).
 	nodes := []model.BaseNode{rootNode(repo.ID)}
 	var blobOIDs []string
@@ -1130,6 +1137,13 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	for oid, size := range known {
+		for _, idx := range blobIndex[oid] {
+			if nodes[idx].SizeState != "known" {
+				nodes[idx].SizeBytes, nodes[idx].SizeState = size, "known"
+			}
+		}
 	}
 	// A blobless clone lacks most blob sizes; ask the remote for them so the
 	// mount can stat and list files without downloading them.
@@ -1347,6 +1361,16 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	if err != nil {
 		return 0, err
 	}
+	pool.duringFetch(func() { size, err = blobToCache(ctx, pool, objectOID, dstPath) })
+	if err == nil {
+		s.mergePacks(repo.GitDir, pool)
+	}
+	return size, err
+}
+
+// blobToCache copies a blob through a pooled cat-file process, which fetches
+// it first when the clone lacks it.
+func blobToCache(ctx context.Context, pool *batchPool, objectOID string, dstPath string) (size int64, err error) {
 	batch, err := pool.acquire(ctx)
 	if err != nil {
 		return 0, err
@@ -1448,6 +1472,56 @@ func readBatchBlob(ctx context.Context, batch *batchCatFile, objectOID string, m
 	}
 }
 
+// FetchBlobs downloads, in one fetch request, the blobs among oids that the
+// clone does not have yet. On a blobless clone `cat-file --batch` would
+// otherwise run one lazy fetch per missing blob, and each request costs about
+// 0.65 s against Artifacts whatever it carries (1 blob 0.65 s, 100 blobs
+// 0.67 s, 1,000 blobs 1.7 s, measured 2026-10-04). It returns how many blobs
+// it asked the remote for. The fetch is the one git's own lazy fetch runs,
+// with the same environment, so the remote's credentials apply unchanged.
+func (s *Store) FetchBlobs(ctx context.Context, repo model.RepoConfig, oids []string) (int, error) {
+	pool, err := s.getPool(repo.GitDir)
+	if err != nil {
+		return 0, err
+	}
+	var missing []string
+	pool.duringFetch(func() {
+		missing, err = missingObjects(ctx, repo.GitDir, oids)
+		if err != nil || len(missing) == 0 {
+			return
+		}
+		input := strings.Join(missing, "\n") + "\n"
+		_, err = runGitInput(ctx, repo.GitDir, nil, strings.NewReader(input),
+			"-c", "fetch.negotiationAlgorithm=noop", "fetch", "--quiet", "origin",
+			"--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin")
+	})
+	if err != nil {
+		return 0, err
+	}
+	s.mergePacks(repo.GitDir, pool)
+	return len(missing), nil
+}
+
+// missingObjects returns the oids the object store does not have, without
+// fetching any of them.
+func missingObjects(ctx context.Context, gitDir string, oids []string) ([]string, error) {
+	if len(oids) == 0 {
+		return nil, nil
+	}
+	input := strings.Join(oids, "\n") + "\n"
+	out, err := runGitInput(ctx, gitDir, []string{"GIT_NO_LAZY_FETCH=1"}, strings.NewReader(input), "cat-file", "--batch-check=%(objectname)", "--buffer")
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, line := range strings.Split(out, "\n") {
+		if oid, ok := strings.CutSuffix(strings.TrimSpace(line), " missing"); ok {
+			missing = append(missing, oid)
+		}
+	}
+	return missing, nil
+}
+
 func (s *Store) VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (bool, error) {
 	out, err := runGit(ctx, repo.GitDir, "hash-object", "--no-filters", cachePath)
 	if err != nil {
@@ -1482,6 +1556,8 @@ type batchPool struct {
 	all      map[*batchCatFile]struct{}
 	closed   bool
 	changed  chan struct{}
+	packs    sync.RWMutex // read: a fetch may run; write: packs are being merged
+	merging  atomic.Bool
 }
 
 func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
@@ -1882,6 +1958,16 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 	if _, err := runGit(ctx, repo.GitDir, "config", "fsmonitor.allowRemote", "true"); err != nil {
 		return err
 	}
+	// With the hook, the untracked cache lets git status skip walking every
+	// folder for untracked files: on a 50,000-entry FSKit mount it went from
+	// 160 s to 0.1 s (the first run builds the cache).
+	if _, err := runGit(ctx, repo.GitDir, "config", "core.untrackedCache", "true"); err != nil {
+		return err
+	}
+	// Clones made by an older daemon still run git's automatic maintenance.
+	if err := configureMaintenance(ctx, repo.GitDir); err != nil {
+		return err
+	}
 	// Git adds the fsmonitor extension on the next porcelain index read. The
 	// daemon must not write the shared index behind a concurrent Git process.
 	return nil
@@ -1924,7 +2010,17 @@ func runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []s
 }
 
 func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
+	return runGitCommand(ctx, gitDir, extraEnv, nil, captureOutput, args...)
+}
+
+// runGitInput runs git with stdin and returns its output.
+func runGitInput(ctx context.Context, gitDir string, extraEnv []string, stdin io.Reader, args ...string) (string, error) {
+	return runGitCommand(ctx, gitDir, extraEnv, stdin, true, args...)
+}
+
+func runGitCommand(ctx context.Context, gitDir string, extraEnv []string, stdin io.Reader, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Stdin = stdin
 	configureCancelableCommand(cmd)
 	env := os.Environ()
 	if gitDir != "" {

@@ -147,12 +147,22 @@ func baseAttr(ino uint64, b model.BaseNode, gen, commitTime int64) (Attr, *model
 	return a, nil
 }
 
-// fillSize learns an unknown base size by downloading the blob, as the FUSE
-// front end does: a wrong size would be cached by the kernel and clip reads.
+// fillSize learns an unknown base size from the remote (object-info), and
+// only when the remote cannot answer, by downloading the blob: a wrong size
+// would be cached by the kernel and clip reads.
 func (s *Server) fillSize(ctx context.Context, a *Attr, b *model.BaseNode) error {
 	if b == nil {
 		return nil
 	}
+	if size, ok := s.eng.RemoteSize(ctx, *b); ok {
+		a.Size = uint64(size)
+		return nil
+	}
+	return s.downloadSize(ctx, a, b)
+}
+
+// downloadSize learns a base size by downloading the blob.
+func (s *Server) downloadSize(ctx context.Context, a *Attr, b *model.BaseNode) error {
 	if b.Type == "symlink" {
 		data, err := s.env.hydrator.ReadBlob(ctx, s.env.repo, *b, maxSymlinkTargetSz)
 		if err != nil {

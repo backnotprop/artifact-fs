@@ -150,10 +150,16 @@ func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (
 }
 
 // ListChildren returns direct children of parentPath using a path-based lookup
-// (no inode join, no collision risk).
+// (no inode join, no collision risk), sorted by path.
+//
+// The sort is done here, not with ORDER BY path: with it SQLite walks the
+// primary key (generation, path) through the whole generation instead of
+// the (generation, parent_path) index. On a 50,000-entry snapshot that made
+// every folder listing 8 ms idle and 87 ms under load (0.1 ms with the
+// index), and the first git status lists every folder (measured 2026-10-04).
 func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseNode, error) {
 	pp := model.CleanPath(parentPath)
-	rows, err := s.db.Query(`SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=? ORDER BY path`, generation, pp)
+	rows, err := s.db.Query(listChildrenSQL, generation, pp)
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +172,11 @@ func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseN
 		}
 		out = append(out, n)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, rows.Err()
 }
+
+const listChildrenSQL = `SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=?`
 
 // GenerationChange is one path that differs between two generations. Old is
 // nil for an added path and New is nil for a removed one.
@@ -254,6 +263,44 @@ func (s *Store) UpdateSizes(ctx context.Context, generation int64, sizes map[str
 		}
 	}
 	return tx.Commit()
+}
+
+// KnownSizes is every blob size the generation knows, by object id, so a new
+// generation need not ask the remote again for blobs it shares.
+func (s *Store) KnownSizes(ctx context.Context, generation int64) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT object_oid, size_bytes FROM base_nodes WHERE generation=? AND size_state='known' AND object_oid!='' AND type IN ('file','symlink')`, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var oid string
+		var size int64
+		if err := rows.Scan(&oid, &size); err != nil {
+			return nil, err
+		}
+		out[oid] = size
+	}
+	return out, rows.Err()
+}
+
+// UnknownSizeOIDs is the blob ids whose size the generation still lacks.
+func (s *Store) UnknownSizeOIDs(ctx context.Context, generation int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT object_oid FROM base_nodes WHERE generation=? AND size_state!='known' AND object_oid!='' AND type IN ('file','symlink')`, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var oid string
+		if err := rows.Scan(&oid); err != nil {
+			return nil, err
+		}
+		out = append(out, oid)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) nextGenerationTx(ctx context.Context, tx *sql.Tx) (int64, error) {

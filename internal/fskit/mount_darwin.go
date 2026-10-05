@@ -107,7 +107,7 @@ func MountRepo(opts MountOptions) (*Mount, error) {
 			log.Warn("fskit: socket server stopped", "repo", cfg.Name, "error", err)
 		}
 	}()
-	if err := runMount(stateDir, cfg.MountPath); err != nil {
+	if err := runMount(stateDir, cfg.MountPath, log); err != nil {
 		srv.Close()
 		return nil, err
 	}
@@ -193,11 +193,60 @@ func mountState(path string) (mounted, known bool) {
 	return st.Dev != parent.Dev, true
 }
 
-// runMount brings up the volume. FSKit path-URL volumes cannot be mounted
-// through DiskArbitration, so the daemon calls /sbin/mount itself; only
-// standard -o options reach FSKit, and the extension derives the mount id and
-// socket from the state folder it receives as its resource.
-func runMount(stateDir, mountPoint string) error {
+// runMount brings up the volume, hidden from the Desktop and Finder's
+// sidebar (nobrowse; see nobrowse_darwin.go). When that way is not available
+// or fails, it runs /sbin/mount, whose volume works the same but shows as a
+// drive. The extension derives the mount id and socket from the state folder
+// it receives as its resource.
+func runMount(stateDir, mountPoint string, log *slog.Logger) error {
+	m := mounter{noBrowse: mountNoBrowse, sbin: runSbinMount, state: extensionState, timeout: mountTimeout, log: log}
+	return m.mount(stateDir, mountPoint)
+}
+
+// mounter is runMount's steps, so a test can stand in for FSKit.
+type mounter struct {
+	noBrowse func(stateDir, mountPoint string, timeout time.Duration) error
+	sbin     func(stateDir, mountPoint string) error
+	state    func() extensionStatus
+	timeout  time.Duration
+	log      *slog.Logger
+}
+
+// mount mounts through FSKit's own calls (nobrowse) and falls back to
+// /sbin/mount only when FSKit loaded nothing: its classes are missing, or it
+// refused the resource. After any later failure, or a call still running at
+// the deadline (FSKit's load and mount calls have no timeout of their own),
+// FSKit may yet finish the first mount, so /sbin/mount is never tried and
+// the two cannot both end up mounted, whichever timer fires first.
+func (m mounter) mount(stateDir, mountPoint string) error {
+	done := make(chan error, 1)
+	go func() { done <- m.noBrowse(stateDir, mountPoint, m.timeout) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(m.timeout):
+		// The stuck call is left behind.
+		return fmt.Errorf("mounting %s timed out after %s. Check that Pando.app is installed and the Pando extension is on in %s. If it is, run killall -9 fskit_agent (it starts again by itself) and try again", mountPoint, m.timeout, settingsPath)
+	}
+	if err == nil {
+		return nil
+	}
+	var unavailable errNoBrowseUnavailable
+	var notLoaded errNotLoaded
+	switch {
+	case errors.As(err, &unavailable):
+		m.log.Warn("fskit: mounting with /sbin/mount; the volume will show on the Desktop", "mount", mountPoint, "reason", err)
+	case errors.As(err, &notLoaded):
+		m.log.Warn("fskit: FSKit refused the volume; trying /sbin/mount for its error", "mount", mountPoint, "error", err)
+	default:
+		return explainMountError(mountPoint, err.Error(), errors.New("nobrowse mount"), m.state())
+	}
+	return m.sbin(stateDir, mountPoint)
+}
+
+// runSbinMount mounts with /sbin/mount. Its -o nobrowse is dropped by macOS
+// 26.3 but asked for anyway, for a macOS that honours it.
+func runSbinMount(stateDir, mountPoint string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), mountTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/sbin/mount", "-F", "-t", FSShortName, "-o", "nobrowse", stateDir, mountPoint)
@@ -208,12 +257,12 @@ func runMount(stateDir, mountPoint string) error {
 	if ctx.Err() != nil {
 		return fmt.Errorf("mounting %s timed out after %s. Check that Pando.app is installed and the Pando extension is on in %s", mountPoint, mountTimeout, settingsPath)
 	}
-	return explainMountError(mountPoint, strings.TrimSpace(string(out)), err, extensionState())
+	return explainMountError(mountPoint, strings.TrimSpace(string(out)), fmt.Errorf("/sbin/mount: %w", err), extensionState())
 }
 
 // explainMountError turns a failed /sbin/mount into a plain instruction.
 func explainMountError(mountPoint, output string, err error, state extensionStatus) error {
-	detail := fmt.Sprintf("(/sbin/mount: %v: %s)", err, output)
+	detail := fmt.Sprintf("(%v: %s)", err, output)
 	switch {
 	case strings.Contains(output, "Operation not permitted"):
 		// mount(2) refused after FSKit set up the volume: a privacy block,

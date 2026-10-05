@@ -499,7 +499,13 @@ func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uin
 
 	mode = normalizeMode(n.Base.Mode, n.Base.Type)
 	size = n.Base.SizeBytes
-	if n.Base.Type == "file" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
+	remote, known := int64(0), false
+	if (n.Base.Type == "file" || n.Base.Type == "symlink") && n.Base.SizeState != "known" {
+		remote, known = fs.engine.RemoteSize(ctx, n.Base)
+	}
+	if known {
+		size = remote
+	} else if n.Base.Type == "file" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
 		_, hydratedSize, hErr := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base)
 		if hErr != nil {
 			return 0, 0, "", time.Time{}, time.Time{}, hErr

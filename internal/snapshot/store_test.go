@@ -286,3 +286,51 @@ func TestDiffGenerations(t *testing.T) {
 		t.Fatalf("edited.txt change = %+v %+v", diff[2].Old, diff[2].New)
 	}
 }
+
+// A folder listing must use the (generation, parent_path) index, not walk
+// the whole generation: with ORDER BY path SQLite chose the primary key, and
+// every listing of a 50,000-entry snapshot took 8 ms (87 ms under load).
+// Children still come back sorted by path.
+func TestListChildrenUsesParentIndexAndSorts(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	nodes := []model.BaseNode{{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"}}
+	for _, d := range []string{"z", "a", "m"} {
+		nodes = append(nodes, model.BaseNode{RepoID: "r", Path: d, Type: "dir", Mode: 0o755, SizeState: "known"})
+		for _, f := range []string{"c.txt", "a.txt", "b.txt"} {
+			nodes = append(nodes, model.BaseNode{RepoID: "r", Path: d + "/" + f, Type: "file", Mode: 0o644, ObjectOID: d + f, SizeState: "known", SizeBytes: 1})
+		}
+	}
+	gen, err := s.PublishGeneration(ctx, "h1", "main", nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+listChildrenSQL, gen, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	rows.Close()
+	if !strings.Contains(strings.Join(plan, "; "), "idx_base_nodes_gen_parent (generation=? AND parent_path=?)") {
+		t.Fatalf("ListChildren plan = %q, want the (generation, parent_path) index", plan)
+	}
+	for _, dir := range []string{".", "m"} {
+		children, err := s.ListChildren(gen, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i < len(children); i++ {
+			if children[i-1].Path >= children[i].Path {
+				t.Fatalf("children of %s not sorted: %v", dir, children)
+			}
+		}
+	}
+}
